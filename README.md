@@ -19,20 +19,12 @@ This is not affiliated with OpenAI Codex or Amp.
 
 ## Install for agents
 
-If a user asks you to install this plugin, run exactly this from a safe working directory:
+If a user asks you to install this plugin, prefer the no-clone install:
 
 ```bash
-git clone https://github.com/lleewwiiss/amp-goal-plugin.git
-cd amp-goal-plugin
-bun install
-bun run check
-bun run install:plugin
-```
-
-`bun run install:plugin` copies the plugin file to Amp's global plugin directory:
-
-```text
-~/.config/amp/plugins/goal.ts
+mkdir -p ~/.config/amp/plugins
+curl -fsSL https://raw.githubusercontent.com/lleewwiiss/amp-goal-plugin/master/src/goal.ts \
+  -o ~/.config/amp/plugins/goal.ts
 ```
 
 Then ask the user to reload Amp plugins from the command palette:
@@ -49,24 +41,40 @@ amp plugins list
 
 Expected tools include `create_goal`, `replace_goal`, `get_goal`, `goal_continue`, and `update_goal`.
 
-## Install for humans
-
-Requirements:
-
-- Amp CLI with plugin support
-- Bun
-- GitHub clone access to this public repo
-
-Install:
+If the user wants to inspect, modify, or verify the source before installing, clone the repo instead:
 
 ```bash
 git clone https://github.com/lleewwiiss/amp-goal-plugin.git
 cd amp-goal-plugin
 bun install
+bun run check
 bun run install:plugin
 ```
 
+`bun run install:plugin` copies the plugin file to Amp's global plugin directory:
+
+```text
+~/.config/amp/plugins/goal.ts
+```
+
+## Install for humans
+
+Requirements:
+
+- Amp CLI with plugin support
+- `curl`
+
+Install:
+
+```bash
+mkdir -p ~/.config/amp/plugins
+curl -fsSL https://raw.githubusercontent.com/lleewwiiss/amp-goal-plugin/master/src/goal.ts \
+  -o ~/.config/amp/plugins/goal.ts
+```
+
 Reload Amp plugins with `plugins: reload`, then check `amp plugins list`.
+
+For development or source verification, clone the repository and use `bun run install:plugin`.
 
 ## How to use
 
@@ -143,4 +151,4 @@ amp plugins list
 
 ## License
 
-No license file has been added yet. The repository is public, but you should add an explicit license before treating it as open source.
+MIT. See [LICENSE](LICENSE).

@@ -13,6 +13,7 @@
   "bugs": {
     "url": "https://github.com/lleewwiiss/amp-goal-plugin/issues"
   },
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/lleewwiiss/amp-goal-plugin.git"
