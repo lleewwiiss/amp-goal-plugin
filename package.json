@@ -1,0 +1,44 @@
+{
+  "name": "amp-goal-plugin",
+  "version": "0.1.0",
+  "description": "Autonomous goal continuation plugin for Amp.",
+  "keywords": [
+    "amp",
+    "ampcode",
+    "autonomous-agent",
+    "goal",
+    "plugin"
+  ],
+  "homepage": "https://github.com/lleewwiiss/amp-goal-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/lleewwiiss/amp-goal-plugin/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lleewwiiss/amp-goal-plugin.git"
+  },
+  "files": [
+    "src/goal.ts",
+    "types/ampcode-plugin.d.ts",
+    "README.md"
+  ],
+  "type": "module",
+  "scripts": {
+    "check": "bun run typecheck && bun run lint && bun run format:check",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "install:plugin": "mkdir -p ~/.config/amp/plugins && cp src/goal.ts ~/.config/amp/plugins/goal.ts",
+    "lint": "oxlint .",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@nkzw/eslint-plugin": "^2.0.0",
+    "@nkzw/oxlint-config": "^1.2.1",
+    "eslint-plugin-no-only-tests": "^3.4.0",
+    "eslint-plugin-perfectionist": "^5.9.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "oxfmt": "^0.51.0",
+    "oxlint": "^1.66.0",
+    "typescript": "^5.9.3"
+  }
+}
