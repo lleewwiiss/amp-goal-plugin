@@ -1,13 +1,15 @@
 {
   "name": "amp-goal-plugin",
   "version": "0.1.0",
-  "description": "Autonomous goal continuation plugin for Amp.",
+  "description": "Compaction-safe goal and workflow continuation plugin for Amp.",
   "keywords": [
     "amp",
     "ampcode",
     "autonomous-agent",
     "goal",
-    "plugin"
+    "handoff",
+    "plugin",
+    "workflow"
   ],
   "homepage": "https://github.com/lleewwiiss/amp-goal-plugin#readme",
   "bugs": {

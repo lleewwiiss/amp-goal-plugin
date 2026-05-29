@@ -2,6 +2,12 @@ declare module "@ampcode/plugin" {
   export interface PluginAPI {
     configuration: PluginConfiguration<Record<string, unknown>>;
     experimental?: ExperimentalPluginAPI;
+    helpers: {
+      filePathFromURI(uri: URI): string;
+      filesModifiedByToolCall(event: ToolCall | ToolResult): Array<URI> | null;
+      shellCommandFromToolCall(event: ToolCall): ShellCommand | null;
+      toolCallsInMessages(messages: Array<ThreadMessage>): Array<ToolCallWithResult>;
+    };
     logger: PluginLogger;
     on(
       event: "session.start",
@@ -65,6 +71,7 @@ declare module "@ampcode/plugin" {
   }
 
   export interface PluginConfiguration<T> {
+    delete(key: keyof T, target?: "workspace" | "global"): Promise<void>;
     get(): Promise<T>;
     update(partial: Partial<T>, target?: "workspace" | "global"): Promise<void>;
   }
@@ -121,11 +128,78 @@ declare module "@ampcode/plugin" {
     type: "user-message";
   }
 
-  export interface ToolCallEvent {
+  export interface URI {
+    toString(): string;
+  }
+
+  export interface ThreadTextBlock {
+    text: string;
+    type: "text";
+  }
+
+  export interface ThreadThinkingBlock {
+    thinking: string;
+    type: "thinking";
+  }
+
+  export interface ThreadToolUseBlock {
+    id: string;
     input: Record<string, unknown>;
-    thread: { id: string };
+    name: string;
+    type: "tool_use";
+  }
+
+  export interface ThreadToolResultBlock {
+    output?: PluginToolResult;
+    status: "done" | "error" | "cancelled" | "running" | "pending";
+    toolUseID: string;
+    type: "tool_result";
+  }
+
+  export interface ThreadUserMessage {
+    content: Array<ThreadTextBlock | ThreadToolResultBlock>;
+    id: string | number;
+    role: "user";
+  }
+
+  export interface ThreadAssistantMessage {
+    content: Array<ThreadTextBlock | ThreadThinkingBlock | ThreadToolUseBlock>;
+    id: string | number;
+    role: "assistant";
+  }
+
+  export interface ThreadInfoMessage {
+    content: Array<ThreadTextBlock>;
+    id: string | number;
+    role: "info";
+  }
+
+  export type ThreadMessage = ThreadUserMessage | ThreadAssistantMessage | ThreadInfoMessage;
+
+  export interface ToolCall {
+    input: Record<string, unknown>;
     tool: string;
     toolUseID: string;
+  }
+
+  export interface ToolResult extends ToolCall {
+    error?: string;
+    output?: unknown;
+    status: "done" | "error" | "cancelled";
+  }
+
+  export interface ToolCallWithResult {
+    call: ToolCall;
+    result: ToolResult;
+  }
+
+  export interface ShellCommand {
+    command: string;
+    dir?: string;
+  }
+
+  export interface ToolCallEvent extends ToolCall {
+    thread: { id: string };
   }
 
   export interface SessionStartEvent {
@@ -152,16 +226,23 @@ declare module "@ampcode/plugin" {
   export interface AgentEndEvent {
     id: string | number;
     message: string;
-    messages: Array<unknown>;
+    messages: Array<ThreadMessage>;
     status: "done" | "error" | "cancelled";
     thread: { id: string };
   }
 
   export type AgentEndResult = { action: "continue"; userMessage: string } | void;
 
+  export type PluginToolResult =
+    | string
+    | Array<{ data: string; mimeType: string; type: "image" } | { text: string; type: "text" }>;
+
   export interface PluginToolDefinition {
     description: string;
-    execute(input: Record<string, unknown>, ctx: PluginToolContext): Promise<string | void>;
+    execute(
+      input: Record<string, unknown>,
+      ctx: PluginToolContext,
+    ): Promise<PluginToolResult | void>;
     inputSchema: {
       [key: string]: unknown;
       properties?: Record<string, object>;
