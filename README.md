@@ -31,7 +31,6 @@ flowchart TD
 - Claude-like workflow discipline: stable step ids, dependencies, per-step verification, handoff.
 - Amp-native runner: lifecycle continuation, status item, config storage, and tool-history receipts.
 - Evidence-first completion: prompts the agent to prove the full objective before `complete`.
-- Quiet idle UX: no `Goal: none` status item.
 
 ## Why not just copy workflows?
 
