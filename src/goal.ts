@@ -59,16 +59,19 @@ interface LegacyGoalState {
 }
 
 interface WorkflowStep {
+  dependsOn: Array<string>;
   evidence?: string;
+  id: string;
   status: WorkflowStepStatus;
   text: string;
+  verification: Array<string>;
 }
 
 const LEGACY_CONFIG_KEY = "goalPlugin";
 const THREAD_CONFIG_PREFIX = "goalPlugin.thread.";
 const GOAL_CONTINUE_TOOL_NAME = "goal_continue";
 const GOAL_CONTINUE_TRIGGER_MESSAGE =
-  "Call the goal_continue tool now, then continue working toward the active thread goal.";
+  "Call the workflow_continue tool now, then continue working toward the active thread goal.";
 const STATUS_ITEM_URL = "command:goal-menu";
 const STATUS_REFRESH_INTERVAL_MS = 5000;
 const MAX_RECEIPTS = 8;
@@ -78,6 +81,9 @@ const MAX_RENDERED_RECEIPTS = 3;
 const MAX_HANDOFF_NEXT_STEPS = 8;
 const MAX_HANDOFF_REFERENCES = 10;
 const MAX_WORKFLOW_STEPS = 7;
+const MAX_WORKFLOW_STEP_ID_LENGTH = 48;
+const MAX_WORKFLOW_STEP_DEPENDENCIES = 4;
+const MAX_WORKFLOW_STEP_VERIFICATION = 4;
 const MAX_TEXT_LENGTH = 1200;
 const MAX_SHORT_TEXT_LENGTH = 240;
 const WORKFLOW_STEP_STATUSES = ["pending", "active", "done", "blocked"] as const;
@@ -125,6 +131,9 @@ export default function goalPlugin(amp: PluginAPI) {
       if (choice === "Workflow") {
         await ctx.ui.notify(renderWorkflowSummary(goal));
       }
+      if (choice === "Run Workflow") {
+        await runWorkflowCommand(amp, status, ctx, threadId);
+      }
       if (choice === "Handoff") {
         await ctx.ui.notify(renderHandoffSummary(goal));
       }
@@ -154,7 +163,7 @@ export default function goalPlugin(amp: PluginAPI) {
     "goal-workflow",
     {
       category: "goal",
-      description: "Show this thread's workflow checklist and verification plan.",
+      description: "Show this thread's workflow ledger and verification plan.",
       title: "Show goal workflow",
     },
     async (ctx) => {
@@ -165,6 +174,23 @@ export default function goalPlugin(amp: PluginAPI) {
 
       const goal = await getGoal(amp, threadId);
       await ctx.ui.notify(goal ? renderWorkflowSummary(goal) : "No goal set for this thread.");
+    },
+  );
+
+  amp.registerCommand(
+    "goal-run-workflow",
+    {
+      category: "goal",
+      description: "Show and activate this goal's next runnable workflow step.",
+      title: "Run goal workflow",
+    },
+    async (ctx) => {
+      const threadId = getThreadId(ctx);
+      if (!threadId) {
+        return;
+      }
+
+      await runWorkflowCommand(amp, status, ctx, threadId);
     },
   );
 
@@ -336,47 +362,85 @@ export default function goalPlugin(amp: PluginAPI) {
   });
 
   amp.registerTool({
-    description: `Create or replace the active goal's Amp-native workflow ledger. Use this for long-running work after inspecting current state: keep 1-${MAX_WORKFLOW_STEPS} outcome-based steps, mark progress with pending/active/done/blocked, and include concrete verification checks. Prefer 3-${MAX_WORKFLOW_STEPS} steps for meaningfully multi-step work. Call again only when the workflow materially changes or a step completes/blocks.`,
+    description: `Create or replace the active goal's whole workflow ledger. Use this when the workflow materially changes after inspecting current state. For normal step progress, prefer update_workflow_step so stable ids, dependencies, and evidence stay intact.`,
     async execute() {
       return "update_goal_workflow is handled by the goal plugin.";
     },
+    inputSchema: workflowInputSchema(),
+    name: "update_goal_workflow",
+  });
+
+  amp.registerTool({
+    description:
+      "Create a dependency-aware workflow plan for the active goal using Amp-native state. Use stable step ids, explicit dependencies, and per-step verification when the task needs phased orchestration.",
+    async execute() {
+      return "create_workflow is handled by the goal plugin.";
+    },
+    inputSchema: workflowInputSchema(),
+    name: "create_workflow",
+  });
+
+  amp.registerTool({
+    description:
+      "Update one persisted workflow step by step_id or 1-based index. Use this instead of replacing the whole workflow when a phase starts, finishes, blocks, or gets better evidence.",
+    async execute() {
+      return "update_workflow_step is handled by the goal plugin.";
+    },
     inputSchema: {
       properties: {
-        steps: {
-          description: `Required non-empty ordered checklist with at most ${MAX_WORKFLOW_STEPS} steps. Each step needs text and may include status: pending, active, done, or blocked; status defaults to active for the first step and pending for the rest. Use at most one active or blocked step.`,
-          items: {
-            properties: {
-              evidence: {
-                description: "Optional brief evidence or note proving this step's current status.",
-                type: "string",
-              },
-              status: {
-                description:
-                  "Optional step status. Defaults to active for the first step and pending for the rest.",
-                enum: [...WORKFLOW_STEP_STATUSES],
-                type: "string",
-              },
-              text: {
-                description: "Outcome-oriented step text.",
-                type: "string",
-              },
-            },
-            required: ["text"],
-            type: "object",
-          },
-          type: "array",
+        evidence: {
+          description:
+            "Brief evidence for the new status. Required when marking a step done or blocked.",
+          type: "string",
+        },
+        index: {
+          description: "Optional 1-based step number when step_id is not provided.",
+          minimum: 1,
+          type: "integer",
+        },
+        status: {
+          description: "Optional new status for the step.",
+          enum: [...WORKFLOW_STEP_STATUSES],
+          type: "string",
+        },
+        step_id: {
+          description: "Stable step id to update.",
+          type: "string",
+        },
+        text: {
+          description: "Optional replacement step text.",
+          type: "string",
         },
         verification: {
-          description:
-            "Optional concrete checks that prove the workflow is done, such as test commands, manual observations, docs updates, or review gates. Omit to keep existing verification checks.",
+          description: "Optional replacement verification checks for this step.",
           items: { type: "string" },
           type: "array",
         },
       },
-      required: ["steps"],
+      required: [],
       type: "object",
     },
-    name: "update_goal_workflow",
+    name: "update_workflow_step",
+  });
+
+  amp.registerTool({
+    description:
+      "Activate and return the next runnable workflow step for the active goal. This is the Amp-native workflow runner: dependencies must be done before a pending step becomes active.",
+    async execute() {
+      return "run_workflow is handled by the goal plugin.";
+    },
+    inputSchema: emptyInputSchema(),
+    name: "run_workflow",
+  });
+
+  amp.registerTool({
+    description:
+      "Return compaction-safe workflow execution context for the active goal. It also activates the next runnable step when no step is currently active.",
+    async execute() {
+      return "workflow_continue is handled by the goal plugin.";
+    },
+    inputSchema: emptyInputSchema(),
+    name: "workflow_continue",
   });
 
   amp.registerTool({
@@ -430,8 +494,17 @@ export default function goalPlugin(amp: PluginAPI) {
     if (event.tool === GOAL_CONTINUE_TOOL_NAME) {
       return handleGoalContinueTool(amp, event);
     }
-    if (event.tool === "update_goal_workflow") {
+    if (event.tool === "update_goal_workflow" || event.tool === "create_workflow") {
       return handleUpdateGoalWorkflowTool(amp, status, event);
+    }
+    if (event.tool === "update_workflow_step") {
+      return handleUpdateWorkflowStepTool(amp, status, event);
+    }
+    if (event.tool === "run_workflow") {
+      return handleRunWorkflowTool(amp, status, event);
+    }
+    if (event.tool === "workflow_continue") {
+      return handleWorkflowContinueTool(amp, status, event);
     }
     if (event.tool === "update_goal_handoff") {
       return handleUpdateGoalHandoffTool(amp, status, event);
@@ -468,6 +541,11 @@ export default function goalPlugin(amp: PluginAPI) {
 interface GoalStatusController {
   refresh(threadId?: string): Promise<void>;
   start(threadId?: string): Promise<void>;
+}
+
+interface WorkflowRunResult {
+  exitCode: number;
+  output: string;
 }
 
 function createGoalStatus(amp: PluginAPI): GoalStatusController {
@@ -547,12 +625,120 @@ function getThreadId(ctx: PluginCommandContext): string | undefined {
 
 function goalMenuOptions(goal: GoalRecord) {
   return goal.status === "active"
-    ? ["Workflow", "Handoff", "Pause", "Clear"]
-    : ["Workflow", "Handoff", "Resume", "Clear"];
+    ? ["Run Workflow", "Workflow", "Handoff", "Pause", "Clear"]
+    : ["Run Workflow", "Workflow", "Handoff", "Resume", "Clear"];
+}
+
+function emptyInputSchema() {
+  return {
+    properties: {},
+    required: [],
+    type: "object" as const,
+  };
+}
+
+function workflowInputSchema() {
+  return {
+    properties: {
+      steps: {
+        description: `Required non-empty ordered workflow with at most ${MAX_WORKFLOW_STEPS} steps. Each step needs text; stable id, depends_on, status, evidence, and verification are optional. Use at most one active or blocked step.`,
+        items: {
+          properties: {
+            depends_on: {
+              description: `Optional array of step ids that must be done first. At most ${MAX_WORKFLOW_STEP_DEPENDENCIES}.`,
+              items: { type: "string" },
+              type: "array",
+            },
+            evidence: {
+              description: "Optional brief evidence or note proving this step's current status.",
+              type: "string",
+            },
+            id: {
+              description:
+                "Optional stable id for dependency references. Defaults to an existing matching-position id when updating, otherwise step-1, step-2, etc.",
+              type: "string",
+            },
+            status: {
+              description:
+                "Optional step status. Defaults to active for the first step and pending for the rest.",
+              enum: [...WORKFLOW_STEP_STATUSES],
+              type: "string",
+            },
+            text: {
+              description: "Outcome-oriented step text.",
+              type: "string",
+            },
+            verification: {
+              description: `Optional per-step proof checks. At most ${MAX_WORKFLOW_STEP_VERIFICATION}.`,
+              items: { type: "string" },
+              type: "array",
+            },
+          },
+          required: ["text"],
+          type: "object",
+        },
+        type: "array",
+      },
+      verification: {
+        description:
+          "Optional concrete checks that prove the entire workflow is done. Omit to keep existing verification checks.",
+        items: { type: "string" },
+        type: "array",
+      },
+    },
+    required: ["steps"],
+    type: "object" as const,
+  };
 }
 
 async function showGoalStatus(amp: PluginAPI, ctx: PluginCommandContext, threadId: string) {
   await ctx.ui.notify(await summarizeCurrentGoal(amp, threadId));
+}
+
+async function runWorkflowCommand(
+  amp: PluginAPI,
+  statusController: GoalStatusController,
+  ctx: PluginCommandContext,
+  threadId: string,
+) {
+  const result = await runWorkflowForThread(amp, statusController, threadId);
+  await ctx.ui.notify(result.output);
+}
+
+async function runWorkflowForThread(
+  amp: PluginAPI,
+  statusController: GoalStatusController,
+  threadId: string,
+  toolName?: string,
+): Promise<WorkflowRunResult> {
+  const prefix = toolName ? `${toolName} failed: ` : "";
+  const goal = await getGoal(amp, threadId);
+  if (!goal) {
+    return {
+      exitCode: 1,
+      output: toolName ? `${prefix}no goal set for this thread.` : "No goal set for this thread.",
+    };
+  }
+  if (goal.status !== "active") {
+    return {
+      exitCode: 1,
+      output: toolName
+        ? `${prefix}goal status is ${goal.status}.`
+        : `Goal status is ${goal.status}. Resume it before running the workflow.`,
+    };
+  }
+
+  const result = activateNextWorkflowStep(goal);
+  if (typeof result === "string") {
+    return { exitCode: goal.workflow ? 0 : 1, output: result };
+  }
+
+  if (result.changed) {
+    await updateGoalRecord(amp, threadId, result.goal);
+    await statusController.refresh(threadId);
+  }
+
+  return { exitCode: 0, output: renderWorkflowRunSummary(result.goal) };
 }
 
 async function setGoalStatus(
@@ -699,14 +885,16 @@ async function handleUpdateGoalWorkflowTool(
   statusController: GoalStatusController,
   event: ToolCallEvent,
 ) {
+  const toolName = event.tool;
   const goal = await getGoal(amp, event.thread.id);
   if (!goal) {
-    return synthesize("update_goal_workflow failed: no goal set for this thread.", 1);
+    return synthesize(`${toolName} failed: no goal set for this thread.`, 1);
   }
 
-  const workflow = decodeWorkflowInput(event.input, goal.workflow);
+  const existingWorkflow = event.tool === "create_workflow" ? undefined : goal.workflow;
+  const workflow = decodeWorkflowInput(event.input, existingWorkflow);
   if (typeof workflow === "string") {
-    return synthesize(`update_goal_workflow failed: ${workflow}`, 1);
+    return synthesize(`${toolName} failed: ${workflow}`, 1);
   }
 
   const nextGoal = {
@@ -718,6 +906,61 @@ async function handleUpdateGoalWorkflowTool(
   await statusController.refresh(event.thread.id);
 
   return synthesize(renderWorkflowSummary(nextGoal));
+}
+
+async function handleUpdateWorkflowStepTool(
+  amp: PluginAPI,
+  statusController: GoalStatusController,
+  event: ToolCallEvent,
+) {
+  const goal = await getGoal(amp, event.thread.id);
+  if (!goal) {
+    return synthesize("update_workflow_step failed: no goal set for this thread.", 1);
+  }
+  if (!goal.workflow) {
+    return synthesize("update_workflow_step failed: no workflow set for this goal.", 1);
+  }
+
+  const workflow = updateWorkflowStep(goal.workflow, event.input);
+  if (typeof workflow === "string") {
+    return synthesize(`update_workflow_step failed: ${workflow}`, 1);
+  }
+
+  const nextGoal = {
+    ...goal,
+    updatedAt: Date.now(),
+    workflow,
+  };
+  await updateGoalRecord(amp, event.thread.id, nextGoal);
+  await statusController.refresh(event.thread.id);
+
+  return synthesize(renderWorkflowSummary(nextGoal));
+}
+
+async function handleRunWorkflowTool(
+  amp: PluginAPI,
+  statusController: GoalStatusController,
+  event: ToolCallEvent,
+) {
+  const result = await runWorkflowForThread(amp, statusController, event.thread.id, event.tool);
+  return synthesize(result.output, result.exitCode);
+}
+
+async function handleWorkflowContinueTool(
+  amp: PluginAPI,
+  statusController: GoalStatusController,
+  event: ToolCallEvent,
+) {
+  const goal = await getGoal(amp, event.thread.id);
+  if (!goal) {
+    return synthesize("workflow_continue failed: no goal set for this thread.", 1);
+  }
+  if (goal.status !== "active") {
+    return synthesize(`workflow_continue failed: goal status is ${goal.status}.`, 1);
+  }
+
+  const nextGoal = await activateWorkflowIfIdle(amp, statusController, event.thread.id, goal);
+  return synthesize(renderGoalContext(nextGoal));
 }
 
 async function handleUpdateGoalHandoffTool(
@@ -797,6 +1040,152 @@ function goalElapsedMs(goal: GoalRecord, now = Date.now()) {
   }
 
   return goal.activeDurationMs + Math.max(0, now - goal.activeSince);
+}
+
+async function activateWorkflowIfIdle(
+  amp: PluginAPI,
+  statusController: GoalStatusController,
+  threadId: string,
+  goal: GoalRecord,
+) {
+  const result = activateNextWorkflowStep(goal);
+  if (typeof result === "string" || !result.changed) {
+    return goal;
+  }
+
+  await updateGoalRecord(amp, threadId, result.goal);
+  await statusController.refresh(threadId);
+  return result.goal;
+}
+
+function activateNextWorkflowStep(
+  goal: GoalRecord,
+): { changed: boolean; goal: GoalRecord } | string {
+  const workflow = goal.workflow;
+  if (!workflow) {
+    return "No workflow set for this goal yet.";
+  }
+
+  if (workflow.steps.some(isCurrentWorkflowStep)) {
+    return { changed: false, goal };
+  }
+
+  const runnableIndex = findNextRunnableStepIndex(workflow);
+  if (runnableIndex === undefined) {
+    if (workflow.steps.every((step) => step.status === "done")) {
+      return "Workflow complete. Run the workflow verification checks before marking the goal complete.";
+    }
+    return `No runnable workflow step. Check dependencies.\n${renderWorkflowSummary(goal)}`;
+  }
+
+  const now = Date.now();
+  const nextSteps = workflow.steps.map((step, index) =>
+    index === runnableIndex ? { ...step, status: "active" as const } : step,
+  );
+
+  return {
+    changed: true,
+    goal: {
+      ...goal,
+      updatedAt: now,
+      workflow: { ...workflow, steps: nextSteps },
+    },
+  };
+}
+
+function findNextRunnableStepIndex(workflow: GoalWorkflow) {
+  const doneStepIds = new Set(
+    workflow.steps.filter((step) => step.status === "done").map((step) => step.id),
+  );
+  const index = workflow.steps.findIndex(
+    (step) =>
+      step.status === "pending" &&
+      step.dependsOn.every((dependency) => doneStepIds.has(dependency)),
+  );
+  return index >= 0 ? index : undefined;
+}
+
+function updateWorkflowStep(
+  workflow: GoalWorkflow,
+  input: Record<string, unknown>,
+): GoalWorkflow | string {
+  const stepIdInput =
+    getString(input, "step_id") ?? getString(input, "stepId") ?? getString(input, "id");
+  const stepId = stepIdInput ? normalizeWorkflowStepId(stepIdInput) : undefined;
+  if (stepIdInput && !stepId) {
+    return "step_id must contain letters, numbers, dashes, or underscores.";
+  }
+
+  const indexInput = getPositiveInteger(input, "index");
+  const stepIndex = stepId
+    ? workflow.steps.findIndex((step) => step.id === stepId)
+    : indexInput === undefined
+      ? -1
+      : indexInput - 1;
+  if (stepIndex < 0 || stepIndex >= workflow.steps.length) {
+    return "provide a valid step_id or 1-based index.";
+  }
+
+  const status = input.status === undefined ? undefined : decodeWorkflowStepStatus(input.status);
+  if (input.status !== undefined && !status) {
+    return `status must be one of ${formatQuotedList(WORKFLOW_STEP_STATUSES)}.`;
+  }
+
+  const text =
+    input.text === undefined ? undefined : decodeRequiredText(input.text, MAX_TEXT_LENGTH);
+  if (input.text !== undefined && text === undefined) {
+    return "text must be a non-empty string when provided.";
+  }
+  if (input.evidence !== undefined && typeof input.evidence !== "string") {
+    return "evidence must be a string when provided.";
+  }
+  const evidence =
+    input.evidence === undefined
+      ? undefined
+      : trimPersistedText(input.evidence, MAX_SHORT_TEXT_LENGTH) || undefined;
+
+  const verification =
+    input.verification === undefined
+      ? undefined
+      : decodeBoundedTextList(input.verification, MAX_WORKFLOW_STEP_VERIFICATION);
+  if (input.verification !== undefined && verification === undefined) {
+    return `verification must be an array of strings with at most ${MAX_WORKFLOW_STEP_VERIFICATION} items.`;
+  }
+
+  const currentStep = workflow.steps[stepIndex];
+  if (!currentStep) {
+    return "provide a valid step_id or 1-based index.";
+  }
+
+  const nextStatus = status ?? currentStep.status;
+  const nextEvidence = evidence === undefined ? currentStep.evidence : evidence;
+  if ((status === "done" || status === "blocked") && !evidence) {
+    return "evidence is required when marking a step done or blocked.";
+  }
+
+  const nextSteps = workflow.steps.map((step, index) => {
+    if (index !== stepIndex) {
+      return isCurrentWorkflowStep(step) && isCurrentStatus(nextStatus)
+        ? { ...step, status: "pending" as const }
+        : step;
+    }
+
+    return {
+      ...step,
+      evidence: nextEvidence,
+      status: nextStatus,
+      text: text ?? step.text,
+      verification: verification ?? step.verification,
+    };
+  });
+
+  const nextWorkflow = { ...workflow, steps: nextSteps };
+  const validationError = validateWorkflow(nextWorkflow);
+  return validationError ?? nextWorkflow;
+}
+
+function isCurrentStatus(status: WorkflowStepStatus) {
+  return status === "active" || status === "blocked";
 }
 
 async function getGoal(amp: PluginAPI, threadId: string): Promise<GoalRecord | undefined> {
@@ -939,15 +1328,36 @@ function renderStatusItem(goal: GoalRecord | undefined) {
 
 function renderWorkflowSummary(goal: GoalRecord) {
   if (!goal.workflow) {
-    return "No workflow checklist set for this goal yet.";
+    return "No workflow ledger set for this goal yet.";
   }
 
   return [
     `Workflow: ${renderWorkflowProgressLine(goal.workflow)}`,
-    ...goal.workflow.steps.map(renderWorkflowStepLine),
+    ...goal.workflow.steps.flatMap(renderWorkflowStepBlock),
     goal.workflow.verification.length > 0 ? "" : undefined,
     goal.workflow.verification.length > 0 ? "Verification:" : undefined,
     ...goal.workflow.verification.map((check) => `- ${check}`),
+  ]
+    .filter(isDefined)
+    .join("\n");
+}
+
+function renderWorkflowRunSummary(goal: GoalRecord) {
+  const workflow = goal.workflow;
+  if (!workflow) {
+    return renderWorkflowSummary(goal);
+  }
+
+  const current = getCurrentWorkflowStep(workflow);
+  if (!current) {
+    return renderWorkflowSummary(goal);
+  }
+
+  return [
+    `Workflow: ${renderWorkflowProgressLine(workflow)}`,
+    "Current step:",
+    renderWorkflowStepLine(current.step, current.index),
+    ...renderWorkflowStepDetails(current.step),
   ]
     .filter(isDefined)
     .join("\n");
@@ -1003,10 +1413,27 @@ function renderToolReceipt(receipt: GoalToolReceipt) {
     .join("");
 }
 
+function renderWorkflowStepBlock(step: WorkflowStep, index: number) {
+  return [renderWorkflowStepLine(step, index), ...renderWorkflowStepDetails(step)];
+}
+
 function renderWorkflowStepLine(step: WorkflowStep, index: number) {
-  return `${workflowStepIcon(step.status)} ${index + 1}. ${step.text}${
+  return `${workflowStepIcon(step.status)} ${index + 1}. ${step.id}: ${step.text}${
     step.evidence ? ` — ${step.evidence}` : ""
   }`;
+}
+
+function renderWorkflowStepDetails(step: WorkflowStep) {
+  return [
+    step.dependsOn.length > 0 ? `   after: ${step.dependsOn.join(", ")}` : undefined,
+    ...step.verification.map((check) => `   verify: ${check}`),
+  ].filter(isDefined);
+}
+
+function getCurrentWorkflowStep(workflow: GoalWorkflow) {
+  const index = workflow.steps.findIndex(isCurrentWorkflowStep);
+  const step = workflow.steps[index];
+  return index >= 0 && step ? { index, step } : undefined;
 }
 
 function renderWorkflowProgressLine(workflow: GoalWorkflow) {
@@ -1125,7 +1552,7 @@ Work from evidence:
 Use the current worktree and external state as authoritative. Previous conversation context can help locate relevant work, but inspect the current state before relying on it. Improve, replace, or remove existing work as needed to satisfy the actual objective.
 
 Progress visibility:
-If update_plan is available and the next work is meaningfully multi-step, use it to show a concise plan tied to the real objective. If the goal needs durable workflow progress across continuations, call update_goal_workflow with a short checklist and verification checks after inspecting current state. Prefer 3-${MAX_WORKFLOW_STEPS} steps for meaningful multi-step work; a smaller checklist is acceptable only for a genuinely small remaining slice. If compaction, a fresh session, or another agent may need to continue this work, call update_goal_handoff with a concise purpose-built handoff capsule that points to existing artifacts instead of duplicating them. Keep durable state current as steps complete or the next best action changes. Skip planning overhead for trivial one-step progress, and do not treat a plan update as a substitute for doing the work.
+If update_plan is available and the next work is meaningfully multi-step, use it to show a concise plan tied to the real objective. If the goal needs durable workflow progress across continuations, call create_workflow with a short dependency-aware workflow and verification checks after inspecting current state. Use update_workflow_step when a phase starts, completes, blocks, or gains better evidence; use run_workflow/workflow_continue to activate the next runnable step. Prefer 3-${MAX_WORKFLOW_STEPS} steps for meaningful multi-step work; a smaller workflow is acceptable only for a genuinely small remaining slice. If compaction, a fresh session, or another agent may need to continue this work, call update_goal_handoff with a concise purpose-built handoff capsule that points to existing artifacts instead of duplicating them. Keep durable state current as steps complete or the next best action changes. Skip planning overhead for trivial one-step progress, and do not treat a plan update as a substitute for doing the work.
 
 Fidelity:
 - Optimize each turn for movement toward the requested end state, not for the smallest stable-looking subset or easiest passing change.
@@ -1158,12 +1585,24 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 
 function renderWorkflowContinuation(goal: GoalRecord) {
   if (!goal.workflow) {
-    return `No persisted workflow checklist is set. For multi-step work, call update_goal_workflow after inspecting the current state with 1-${MAX_WORKFLOW_STEPS} outcome-based steps and concrete verification checks. Prefer 3-${MAX_WORKFLOW_STEPS} steps for meaningful multi-step work. Skip this for trivial goals.`;
+    return `No persisted workflow is set. For multi-step work, call create_workflow after inspecting the current state with 1-${MAX_WORKFLOW_STEPS} outcome-based steps, stable ids, dependencies where useful, and concrete verification checks. Skip this for trivial goals.`;
   }
 
+  const current = getCurrentWorkflowStep(goal.workflow);
+  const hasRunnable = findNextRunnableStepIndex(goal.workflow) !== undefined;
+  const isComplete = goal.workflow.steps.every((step) => step.status === "done");
   return [
     renderWorkflowProgressLine(goal.workflow),
-    ...goal.workflow.steps.map(renderWorkflowStepLine),
+    !current && !hasRunnable && !isComplete
+      ? "No runnable step is active. Inspect dependencies or unblock the workflow before continuing."
+      : undefined,
+    current ? "" : undefined,
+    current ? "Current runnable step:" : undefined,
+    current ? renderWorkflowStepLine(current.step, current.index) : undefined,
+    ...(current ? renderWorkflowStepDetails(current.step) : []),
+    current ? "" : undefined,
+    "Workflow ledger:",
+    ...goal.workflow.steps.flatMap(renderWorkflowStepBlock),
     goal.workflow.verification.length > 0 ? "Verification checks:" : undefined,
     ...goal.workflow.verification.map((check) => `- ${check}`),
   ]
@@ -1197,7 +1636,7 @@ Budget and usage:
 - Token budget: ${tokenBudgetText(goal)}
 
 Adjust the current turn to pursue the updated objective. Avoid continuing work that only served the previous objective unless it also helps the updated objective.
-Any previous workflow checklist was cleared to avoid stale progress. Create a new workflow checklist if the updated objective needs durable multi-step progress.
+Any previous workflow ledger was cleared to avoid stale progress. Create a new workflow if the updated objective needs durable multi-step progress.
 
 Do not call update_goal unless the updated goal is actually complete.`;
 }
@@ -1434,28 +1873,31 @@ function decodeWorkflowInput(
 
   const steps: Array<WorkflowStep> = [];
   for (const [index, rawStep] of rawSteps.entries()) {
-    const step = decodeWorkflowStepInput(rawStep, index);
+    const step = decodeWorkflowStepInput(rawStep, index, existing?.steps[index]);
     if (typeof step === "string") {
       return `steps[${index}] ${step}`;
     }
     steps.push(step);
   }
-  if (steps.filter(isCurrentWorkflowStep).length > 1) {
-    return 'steps may include at most one "active" or "blocked" item.';
-  }
 
   const verification =
     input.verification === undefined
       ? (existing?.verification ?? [])
-      : decodeStringArray(input.verification);
+      : decodeBoundedTextList(input.verification, MAX_WORKFLOW_STEPS);
   if (!verification) {
-    return "verification must be an array of strings.";
+    return `verification must be an array of strings with at most ${MAX_WORKFLOW_STEPS} items.`;
   }
 
-  return { steps, verification };
+  const workflow = { steps, verification };
+  const validationError = validateWorkflow(workflow);
+  return validationError ?? workflow;
 }
 
-function decodeWorkflowStepInput(value: unknown, index: number): WorkflowStep | string {
+function decodeWorkflowStepInput(
+  value: unknown,
+  index: number,
+  existing: WorkflowStep | undefined,
+): WorkflowStep | string {
   if (!isRecord(value)) {
     return "must be an object.";
   }
@@ -1475,15 +1917,45 @@ function decodeWorkflowStepInput(value: unknown, index: number): WorkflowStep | 
     return `status must be one of ${formatQuotedList(WORKFLOW_STEP_STATUSES)}.`;
   }
 
+  const idInput =
+    getString(value, "id") ??
+    getString(value, "step_id") ??
+    (existing?.text === text ? existing.id : undefined);
+  const id = normalizeWorkflowStepId(idInput ?? `step-${index + 1}`);
+  if (!id) {
+    return "id must contain letters, numbers, dashes, or underscores.";
+  }
+
   if (value.evidence !== undefined && typeof value.evidence !== "string") {
     return "evidence must be a string when provided.";
   }
 
   const evidence = typeof value.evidence === "string" ? value.evidence.trim() : "";
+  const dependsOn = decodeWorkflowStepIdList(
+    value.depends_on ?? value.dependsOn,
+    "depends_on",
+    MAX_WORKFLOW_STEP_DEPENDENCIES,
+  );
+  if (typeof dependsOn === "string") {
+    return dependsOn;
+  }
+
+  const verification = decodeOptionalTextList(
+    value.verification,
+    "verification",
+    MAX_WORKFLOW_STEP_VERIFICATION,
+  );
+  if (typeof verification === "string") {
+    return verification;
+  }
+
   return {
+    dependsOn,
     evidence: evidence || undefined,
+    id,
     status,
     text,
+    verification,
   };
 }
 
@@ -1497,18 +1969,22 @@ function decodeWorkflow(value: unknown): GoalWorkflow | undefined {
     return undefined;
   }
 
-  const steps = rawSteps.map(decodePersistedWorkflowStep).filter(isDefined);
+  const steps = rawSteps
+    .map((step, index) => decodePersistedWorkflowStep(step, index))
+    .filter(isDefined);
   if (steps.length === 0) {
     return undefined;
   }
 
-  return {
+  const workflow = {
     steps,
-    verification: decodeStringArray(value.verification) ?? [],
+    verification: decodeBoundedTextList(value.verification, MAX_WORKFLOW_STEPS) ?? [],
   };
+
+  return validateWorkflow(workflow) ? undefined : workflow;
 }
 
-function decodePersistedWorkflowStep(value: unknown): WorkflowStep | undefined {
+function decodePersistedWorkflowStep(value: unknown, index: number): WorkflowStep | undefined {
   if (!isRecord(value)) {
     return undefined;
   }
@@ -1520,32 +1996,134 @@ function decodePersistedWorkflowStep(value: unknown): WorkflowStep | undefined {
 
   const status = decodeWorkflowStepStatus(value.status) ?? "pending";
   const evidence = typeof value.evidence === "string" ? value.evidence.trim() : "";
-
-  return {
-    evidence: evidence || undefined,
-    status,
-    text,
-  };
-}
-
-function decodeStringArray(value: unknown) {
-  if (!Array.isArray(value)) {
+  const id = normalizeWorkflowStepId(getString(value, "id") ?? `step-${index + 1}`);
+  if (!id) {
+    return undefined;
+  }
+  const dependsOn = decodeWorkflowStepIdList(
+    value.dependsOn,
+    "dependsOn",
+    MAX_WORKFLOW_STEP_DEPENDENCIES,
+  );
+  if (typeof dependsOn === "string") {
     return undefined;
   }
 
-  const strings: Array<string> = [];
-  for (const item of value) {
-    if (typeof item !== "string") {
-      return undefined;
-    }
+  return {
+    dependsOn,
+    evidence: evidence || undefined,
+    id,
+    status,
+    text,
+    verification: decodeBoundedTextList(value.verification, MAX_WORKFLOW_STEP_VERIFICATION) ?? [],
+  };
+}
 
-    const trimmed = item.trim();
-    if (trimmed) {
-      strings.push(trimmed);
+function validateWorkflow(workflow: GoalWorkflow): string | undefined {
+  if (workflow.steps.filter(isCurrentWorkflowStep).length > 1) {
+    return 'steps may include at most one "active" or "blocked" item.';
+  }
+
+  const stepIds = new Set<string>();
+  for (const step of workflow.steps) {
+    if (stepIds.has(step.id)) {
+      return `duplicate step id "${step.id}".`;
+    }
+    stepIds.add(step.id);
+  }
+
+  const doneStepIds = new Set(
+    workflow.steps.filter((step) => step.status === "done").map((step) => step.id),
+  );
+  for (const step of workflow.steps) {
+    for (const dependency of step.dependsOn) {
+      if (dependency === step.id) {
+        return `step "${step.id}" cannot depend on itself.`;
+      }
+      if (!stepIds.has(dependency)) {
+        return `step "${step.id}" depends on missing step "${dependency}".`;
+      }
+    }
+    if (
+      step.status !== "pending" &&
+      !step.dependsOn.every((dependency) => doneStepIds.has(dependency))
+    ) {
+      return `non-pending step "${step.id}" has unfinished dependencies.`;
     }
   }
 
-  return strings;
+  return detectWorkflowCycle(workflow);
+}
+
+function detectWorkflowCycle(workflow: GoalWorkflow): string | undefined {
+  const stepsById = new Map(workflow.steps.map((step) => [step.id, step]));
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+
+  const visit = (stepId: string): string | undefined => {
+    if (visited.has(stepId)) {
+      return undefined;
+    }
+    if (visiting.has(stepId)) {
+      return `workflow dependencies contain a cycle at "${stepId}".`;
+    }
+
+    visiting.add(stepId);
+    const step = stepsById.get(stepId);
+    for (const dependency of step?.dependsOn ?? []) {
+      const error = visit(dependency);
+      if (error) {
+        return error;
+      }
+    }
+    visiting.delete(stepId);
+    visited.add(stepId);
+    return undefined;
+  };
+
+  for (const step of workflow.steps) {
+    const error = visit(step.id);
+    if (error) {
+      return error;
+    }
+  }
+  return undefined;
+}
+
+function decodeWorkflowStepIdList(
+  value: unknown,
+  field: string,
+  maxItems: number,
+): Array<string> | string {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value) || value.length > maxItems) {
+    return `${field} must be an array of step ids with at most ${maxItems} items.`;
+  }
+
+  const ids: Array<string> = [];
+  for (const item of value) {
+    if (typeof item !== "string") {
+      return `${field} must be an array of step ids with at most ${maxItems} items.`;
+    }
+    const id = normalizeWorkflowStepId(item);
+    if (!id) {
+      return `${field} contains an invalid step id.`;
+    }
+    ids.push(id);
+  }
+  return [...new Set(ids)];
+}
+
+function normalizeWorkflowStepId(value: string) {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replaceAll(/[^a-z0-9_-]+/g, "-")
+    .replaceAll(/^-+|-+$/g, "")
+    .slice(0, MAX_WORKFLOW_STEP_ID_LENGTH);
+  return normalized || undefined;
 }
 
 function decodeRequiredText(value: unknown, maxLength: number): string | undefined {
