@@ -69,6 +69,7 @@ interface WorkflowStep {
 
 const LEGACY_CONFIG_KEY = "goalPlugin";
 const THREAD_CONFIG_PREFIX = "goalPlugin.thread.";
+const GOAL_CONFIG_TARGET = "global";
 const GOAL_CONTINUE_TOOL_NAME = "goal_continue";
 const GOAL_CONTINUE_TRIGGER_MESSAGE =
   "Call the workflow_continue tool now, then continue working toward the active thread goal.";
@@ -1204,13 +1205,13 @@ async function getGoal(amp: PluginAPI, threadId: string): Promise<GoalRecord | u
 }
 
 async function updateGoalRecord(amp: PluginAPI, threadId: string, goal: GoalRecord) {
-  await amp.configuration.update({ [threadConfigKey(threadId)]: goal });
+  await amp.configuration.update({ [threadConfigKey(threadId)]: goal }, GOAL_CONFIG_TARGET);
   await safelyPruneLegacyGoal(amp, threadId);
 }
 
 async function deleteGoalRecord(amp: PluginAPI, threadId: string) {
   await pruneLegacyGoal(amp, threadId);
-  await amp.configuration.delete(threadConfigKey(threadId));
+  await amp.configuration.delete(threadConfigKey(threadId), GOAL_CONFIG_TARGET);
 }
 
 async function safelyPruneLegacyGoal(amp: PluginAPI, threadId: string) {
@@ -1232,11 +1233,14 @@ async function pruneLegacyGoal(amp: PluginAPI, threadId: string) {
   const nextThreads = { ...legacyState.threads };
   delete nextThreads[threadId];
   if (Object.keys(nextThreads).length === 0) {
-    await amp.configuration.delete(LEGACY_CONFIG_KEY);
+    await amp.configuration.delete(LEGACY_CONFIG_KEY, GOAL_CONFIG_TARGET);
     return;
   }
 
-  await amp.configuration.update({ [LEGACY_CONFIG_KEY]: { ...legacyState, threads: nextThreads } });
+  await amp.configuration.update(
+    { [LEGACY_CONFIG_KEY]: { ...legacyState, threads: nextThreads } },
+    GOAL_CONFIG_TARGET,
+  );
 }
 
 function decodeLegacyGoal(config: Record<string, unknown>, threadId: string) {

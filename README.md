@@ -4,6 +4,8 @@ Compaction-safe goals and workflow state for [Amp](https://ampcode.com).
 
 Persistent thread objective, dependency-aware workflow runner, handoff capsule, turn receipts, and a status item that stays hidden until a goal exists.
 
+State is stored in Amp plugin config, not repo files.
+
 > Inspired by Codex CLI `/goal` and Claude Code workflows. Not affiliated with OpenAI, Anthropic, or Amp.
 
 ```mermaid
