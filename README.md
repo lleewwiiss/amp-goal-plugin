@@ -2,7 +2,7 @@
 
 Compaction-safe goals and workflow state for [Amp](https://ampcode.com).
 
-Persistent thread objective, dependency-aware workflow runner, handoff capsule, turn receipts, and a status item that stays hidden until a goal exists.
+Persistent thread objective, dependency-aware phased workflow runner, handoff capsule, turn receipts, workflow events, and an Amp status item.
 
 State is stored in Amp plugin config, not repo files.
 
@@ -17,21 +17,24 @@ flowchart TD
   Run --> Step["next runnable step"]
   Step --> Update["update_workflow_step"]
   Update --> State
+  State --> Snapshot["workflow snapshot"]
   State --> Continue["agent.end -> workflow_continue"]
   Continue --> Agent["Amp agent"]
   Agent --> Update
   Agent --> Handoff["update_goal_handoff"]
   Agent --> Receipts["turn receipts"]
+  Agent --> Events["workflow events"]
   Handoff --> State
   Receipts --> State
-  State --> Status["status item"]
+  Events --> State
+  Snapshot --> Status["status item"]
 ```
 
 ## What it adds
 
 - Codex-like durable goal: objective stays outside fragile chat context.
-- Claude-like workflow discipline: stable step ids, dependencies, per-step verification, handoff.
-- Amp-native runner: lifecycle continuation, status item, config storage, and tool-history receipts.
+- Claude-like workflow discipline: phases, stable step ids, dependencies, per-step verification, handoff.
+- Amp-native runner: lifecycle continuation, config storage, snapshots, event log, status item, and tool-history receipts.
 - Evidence-first completion: prompts the agent to prove the full objective before `complete`.
 
 ## Why not just copy workflows?
@@ -43,6 +46,8 @@ Claude Code workflows are a runtime pattern. This plugin keeps Amp as the runtim
 - `workflow_continue`: resume after compaction or `agent.end`
 - `update_workflow_step`: record active/done/blocked state with evidence
 - `update_goal_handoff`: leave a compact handoff capsule
+
+The difference: the plugin stores compact Amp-native state, derives a fresh workflow snapshot each turn, and renders goal, workflow, receipt, and handoff context into continuation prompts.
 
 ## Install
 

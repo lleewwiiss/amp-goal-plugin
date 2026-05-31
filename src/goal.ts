@@ -10,9 +10,11 @@ import type {
 
 type GoalStatus = "active" | "paused" | "blocked" | "complete";
 type GoalToolReceiptStatus = ToolCallWithResult["result"]["status"];
+type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];
 type WorkflowStepStatus = (typeof WORKFLOW_STEP_STATUSES)[number];
 
 interface GoalWorkflow {
+  events: Array<WorkflowEvent>;
   steps: Array<WorkflowStep>;
   verification: Array<string>;
 }
@@ -58,10 +60,35 @@ interface LegacyGoalState {
   version: 1;
 }
 
+interface WorkflowEvent {
+  at: number;
+  detail?: string;
+  stepId?: string;
+  type: WorkflowEventType;
+}
+
+interface WorkflowPhaseSnapshot {
+  blocked: number;
+  current?: number;
+  done: number;
+  title: string;
+  total: number;
+}
+
+interface WorkflowSnapshot {
+  blocked: number;
+  current?: { index: number; step: WorkflowStep };
+  done: number;
+  nextRunnable?: { index: number; step: WorkflowStep };
+  phases: Array<WorkflowPhaseSnapshot>;
+  total: number;
+}
+
 interface WorkflowStep {
   dependsOn: Array<string>;
   evidence?: string;
   id: string;
+  phase?: string;
   status: WorkflowStepStatus;
   text: string;
   verification: Array<string>;
@@ -73,20 +100,32 @@ const GOAL_CONFIG_TARGET = "global";
 const GOAL_CONTINUE_TOOL_NAME = "goal_continue";
 const GOAL_CONTINUE_TRIGGER_MESSAGE =
   "Call the workflow_continue tool now, then continue working toward the active thread goal.";
+const DEFAULT_WORKFLOW_PHASE_TITLE = "Workflow";
 const STATUS_ITEM_URL = "command:goal-menu";
 const STATUS_REFRESH_INTERVAL_MS = 5000;
 const MAX_RECEIPTS = 8;
 const MAX_RECEIPT_FILES = 6;
 const MAX_RECEIPT_TOOLS = 12;
 const MAX_RENDERED_RECEIPTS = 3;
+const MAX_RENDERED_WORKFLOW_EVENTS = 5;
 const MAX_HANDOFF_NEXT_STEPS = 8;
 const MAX_HANDOFF_REFERENCES = 10;
+const MAX_WORKFLOW_EVENTS = 20;
 const MAX_WORKFLOW_STEPS = 7;
 const MAX_WORKFLOW_STEP_ID_LENGTH = 48;
+const MAX_WORKFLOW_STEP_PHASE_LENGTH = 80;
 const MAX_WORKFLOW_STEP_DEPENDENCIES = 4;
 const MAX_WORKFLOW_STEP_VERIFICATION = 4;
 const MAX_TEXT_LENGTH = 1200;
 const MAX_SHORT_TEXT_LENGTH = 240;
+const WORKFLOW_EVENT_TYPES = [
+  "created",
+  "activated",
+  "updated",
+  "done",
+  "blocked",
+  "handoff",
+] as const;
 const WORKFLOW_STEP_STATUSES = ["pending", "active", "done", "blocked"] as const;
 const ACTIVE_STATUS_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -399,6 +438,10 @@ export default function goalPlugin(amp: PluginAPI) {
           minimum: 1,
           type: "integer",
         },
+        phase: {
+          description: "Optional replacement phase/group label for this step.",
+          type: "string",
+        },
         status: {
           description: "Optional new status for the step.",
           enum: [...WORKFLOW_STEP_STATUSES],
@@ -659,6 +702,10 @@ function workflowInputSchema() {
                 "Optional stable id for dependency references. Defaults to an existing matching-position id when updating, otherwise step-1, step-2, etc.",
               type: "string",
             },
+            phase: {
+              description: "Optional phase/group label for compact progress rendering.",
+              type: "string",
+            },
             status: {
               description:
                 "Optional step status. Defaults to active for the first step and pending for the rest.",
@@ -893,14 +940,23 @@ async function handleUpdateGoalWorkflowTool(
   }
 
   const existingWorkflow = event.tool === "create_workflow" ? undefined : goal.workflow;
-  const workflow = decodeWorkflowInput(event.input, existingWorkflow);
-  if (typeof workflow === "string") {
-    return synthesize(`${toolName} failed: ${workflow}`, 1);
+  const decodedWorkflow = decodeWorkflowInput(event.input, existingWorkflow);
+  if (typeof decodedWorkflow === "string") {
+    return synthesize(`${toolName} failed: ${decodedWorkflow}`, 1);
   }
+  const now = Date.now();
+  const replacingWorkflow = goal.workflow !== undefined;
+  const workflow = appendWorkflowEvent(
+    decodedWorkflow,
+    event.tool === "create_workflow" && !replacingWorkflow ? "created" : "updated",
+    replacingWorkflow ? "workflow replaced" : "workflow set",
+    undefined,
+    now,
+  );
 
   const nextGoal = {
     ...goal,
-    updatedAt: Date.now(),
+    updatedAt: now,
     workflow,
   };
   await updateGoalRecord(amp, event.thread.id, nextGoal);
@@ -922,14 +978,15 @@ async function handleUpdateWorkflowStepTool(
     return synthesize("update_workflow_step failed: no workflow set for this goal.", 1);
   }
 
-  const workflow = updateWorkflowStep(goal.workflow, event.input);
+  const now = Date.now();
+  const workflow = updateWorkflowStep(goal.workflow, event.input, now);
   if (typeof workflow === "string") {
     return synthesize(`update_workflow_step failed: ${workflow}`, 1);
   }
 
   const nextGoal = {
     ...goal,
-    updatedAt: Date.now(),
+    updatedAt: now,
     workflow,
   };
   await updateGoalRecord(amp, event.thread.id, nextGoal);
@@ -983,6 +1040,9 @@ async function handleUpdateGoalHandoffTool(
     ...goal,
     handoff,
     updatedAt: handoff.updatedAt,
+    workflow: goal.workflow
+      ? appendWorkflowEvent(goal.workflow, "handoff", handoff.purpose, undefined, handoff.updatedAt)
+      : goal.workflow,
   };
   await updateGoalRecord(amp, event.thread.id, nextGoal);
   await statusController.refresh(event.thread.id);
@@ -1089,7 +1149,13 @@ function activateNextWorkflowStep(
     goal: {
       ...goal,
       updatedAt: now,
-      workflow: { ...workflow, steps: nextSteps },
+      workflow: appendWorkflowEvent(
+        { ...workflow, steps: nextSteps },
+        "activated",
+        nextSteps[runnableIndex]?.text,
+        nextSteps[runnableIndex]?.id,
+        now,
+      ),
     },
   };
 }
@@ -1109,6 +1175,7 @@ function findNextRunnableStepIndex(workflow: GoalWorkflow) {
 function updateWorkflowStep(
   workflow: GoalWorkflow,
   input: Record<string, unknown>,
+  now = Date.now(),
 ): GoalWorkflow | string {
   const stepIdInput =
     getString(input, "step_id") ?? getString(input, "stepId") ?? getString(input, "id");
@@ -1145,6 +1212,14 @@ function updateWorkflowStep(
       ? undefined
       : trimPersistedText(input.evidence, MAX_SHORT_TEXT_LENGTH) || undefined;
 
+  if (input.phase !== undefined && typeof input.phase !== "string") {
+    return "phase must be a string when provided.";
+  }
+  const phase =
+    input.phase === undefined
+      ? undefined
+      : trimPersistedText(input.phase, MAX_WORKFLOW_STEP_PHASE_LENGTH) || undefined;
+
   const verification =
     input.verification === undefined
       ? undefined
@@ -1174,6 +1249,7 @@ function updateWorkflowStep(
     return {
       ...step,
       evidence: nextEvidence,
+      phase: input.phase === undefined ? step.phase : phase,
       status: nextStatus,
       text: text ?? step.text,
       verification: verification ?? step.verification,
@@ -1182,7 +1258,30 @@ function updateWorkflowStep(
 
   const nextWorkflow = { ...workflow, steps: nextSteps };
   const validationError = validateWorkflow(nextWorkflow);
-  return validationError ?? nextWorkflow;
+  if (validationError) {
+    return validationError;
+  }
+
+  return appendWorkflowEvent(
+    nextWorkflow,
+    workflowStepEventType(currentStep.status, status),
+    nextEvidence ?? text ?? phase,
+    currentStep.id,
+    now,
+  );
+}
+
+function workflowStepEventType(
+  previousStatus: WorkflowStepStatus,
+  requestedStatus: WorkflowStepStatus | undefined,
+): WorkflowEventType {
+  if (requestedStatus === "done" && previousStatus !== "done") {
+    return "done";
+  }
+  if (requestedStatus === "blocked" && previousStatus !== "blocked") {
+    return "blocked";
+  }
+  return "updated";
 }
 
 function isCurrentStatus(status: WorkflowStepStatus) {
@@ -1335,12 +1434,18 @@ function renderWorkflowSummary(goal: GoalRecord) {
     return "No workflow ledger set for this goal yet.";
   }
 
+  const snapshot = workflowSnapshot(goal.workflow);
+
   return [
-    `Workflow: ${renderWorkflowProgressLine(goal.workflow)}`,
-    ...goal.workflow.steps.flatMap(renderWorkflowStepBlock),
+    `Workflow: ${renderWorkflowProgressLineFromSnapshot(snapshot)}`,
+    renderWorkflowPhaseSummary(snapshot),
+    "",
+    "Workflow ledger:",
+    ...renderWorkflowLedger(goal.workflow, snapshot),
     goal.workflow.verification.length > 0 ? "" : undefined,
     goal.workflow.verification.length > 0 ? "Verification:" : undefined,
     ...goal.workflow.verification.map((check) => `- ${check}`),
+    renderWorkflowEventsSummary(goal.workflow),
   ]
     .filter(isDefined)
     .join("\n");
@@ -1352,16 +1457,18 @@ function renderWorkflowRunSummary(goal: GoalRecord) {
     return renderWorkflowSummary(goal);
   }
 
-  const current = getCurrentWorkflowStep(workflow);
-  if (!current) {
+  const snapshot = workflowSnapshot(workflow);
+  if (!snapshot.current) {
     return renderWorkflowSummary(goal);
   }
 
   return [
-    `Workflow: ${renderWorkflowProgressLine(workflow)}`,
+    `Workflow: ${renderWorkflowProgressLineFromSnapshot(snapshot)}`,
     "Current step:",
-    renderWorkflowStepLine(current.step, current.index),
-    ...renderWorkflowStepDetails(current.step),
+    snapshot.current.step.phase ? `Phase: ${snapshot.current.step.phase}` : undefined,
+    renderWorkflowStepLine(snapshot.current.step, snapshot.current.index),
+    ...renderWorkflowStepDetails(snapshot.current.step),
+    renderWorkflowEventsSummary(workflow),
   ]
     .filter(isDefined)
     .join("\n");
@@ -1417,6 +1524,62 @@ function renderToolReceipt(receipt: GoalToolReceipt) {
     .join("");
 }
 
+function renderWorkflowLedger(workflow: GoalWorkflow, snapshot = workflowSnapshot(workflow)) {
+  const hasPhases = workflow.steps.some((step) => step.phase);
+  if (!hasPhases) {
+    return workflow.steps.flatMap(renderWorkflowStepBlock);
+  }
+
+  const lines: Array<string> = [];
+  for (const phase of snapshot.phases) {
+    lines.push(`Phase: ${phase.title} (${renderWorkflowPhaseProgress(phase)})`);
+    for (const [index, step] of workflow.steps.entries()) {
+      if (workflowPhaseTitle(step) === phase.title) {
+        lines.push(...renderWorkflowStepBlock(step, index));
+      }
+    }
+  }
+  return lines;
+}
+
+function renderWorkflowPhaseSummary(snapshot: WorkflowSnapshot) {
+  if (snapshot.phases.length <= 1 && snapshot.phases[0]?.title === DEFAULT_WORKFLOW_PHASE_TITLE) {
+    return undefined;
+  }
+
+  return `Phases: ${snapshot.phases
+    .map((phase) => `${phase.title} ${renderWorkflowPhaseProgress(phase)}`)
+    .join("; ")}`;
+}
+
+function renderWorkflowPhaseProgress(phase: WorkflowPhaseSnapshot) {
+  return [
+    `${phase.done}/${phase.total} done`,
+    phase.blocked > 0 ? `${phase.blocked} blocked` : undefined,
+    phase.current ? `current step ${phase.current}` : undefined,
+  ]
+    .filter(isDefined)
+    .join(", ");
+}
+
+function renderWorkflowEventsSummary(workflow: GoalWorkflow) {
+  if (workflow.events.length === 0) {
+    return undefined;
+  }
+
+  return [
+    "",
+    "Recent workflow events:",
+    ...workflow.events.slice(-MAX_RENDERED_WORKFLOW_EVENTS).map(renderWorkflowEventLine),
+  ].join("\n");
+}
+
+function renderWorkflowEventLine(event: WorkflowEvent) {
+  return `- ${formatRelativeTime(event.at)} ${event.type}${event.stepId ? ` ${event.stepId}` : ""}${
+    event.detail ? `: ${event.detail}` : ""
+  }`;
+}
+
 function renderWorkflowStepBlock(step: WorkflowStep, index: number) {
   return [renderWorkflowStepLine(step, index), ...renderWorkflowStepDetails(step)];
 }
@@ -1434,15 +1597,22 @@ function renderWorkflowStepDetails(step: WorkflowStep) {
   ].filter(isDefined);
 }
 
-function getCurrentWorkflowStep(workflow: GoalWorkflow) {
-  const index = workflow.steps.findIndex(isCurrentWorkflowStep);
-  const step = workflow.steps[index];
-  return index >= 0 && step ? { index, step } : undefined;
+function renderWorkflowProgressLine(workflow: GoalWorkflow) {
+  return renderWorkflowProgressLineFromSnapshot(workflowSnapshot(workflow));
 }
 
-function renderWorkflowProgressLine(workflow: GoalWorkflow) {
-  const progress = workflowProgress(workflow);
-  return `${progress.done}/${progress.total} done${progress.current ? `, step ${progress.current}/${progress.total}` : ""}`;
+function renderWorkflowProgressLineFromSnapshot(snapshot: WorkflowSnapshot) {
+  return [
+    `${snapshot.done}/${snapshot.total} done`,
+    snapshot.blocked > 0 ? `${snapshot.blocked} blocked` : undefined,
+    snapshot.current
+      ? `current ${snapshot.current.index + 1}/${snapshot.total}`
+      : snapshot.nextRunnable
+        ? `next ${snapshot.nextRunnable.index + 1}/${snapshot.total}`
+        : undefined,
+  ]
+    .filter(isDefined)
+    .join(", ");
 }
 
 function renderWorkflowStatusLabel(workflow: GoalWorkflow | undefined) {
@@ -1450,24 +1620,58 @@ function renderWorkflowStatusLabel(workflow: GoalWorkflow | undefined) {
     return undefined;
   }
 
-  const progress = workflowProgress(workflow);
-  return progress.current
-    ? `Step ${progress.current}/${progress.total}`
-    : `${progress.done}/${progress.total} done`;
+  const snapshot = workflowSnapshot(workflow);
+  const next = snapshot.current ?? snapshot.nextRunnable;
+  return next
+    ? `Step ${next.index + 1}/${snapshot.total}`
+    : `${snapshot.done}/${snapshot.total} done`;
 }
 
-function workflowProgress(workflow: GoalWorkflow) {
+function workflowSnapshot(workflow: GoalWorkflow): WorkflowSnapshot {
   const total = workflow.steps.length;
   const done = workflow.steps.filter((step) => step.status === "done").length;
-  const currentIndex = workflow.steps.findIndex(
-    (step) => step.status === "active" || step.status === "blocked",
-  );
+  const blocked = workflow.steps.filter((step) => step.status === "blocked").length;
+  const currentIndex = workflow.steps.findIndex(isCurrentWorkflowStep);
+  const currentStep = workflow.steps[currentIndex];
+  const nextRunnableIndex = findNextRunnableStepIndex(workflow);
+  const nextRunnableStep =
+    nextRunnableIndex === undefined ? undefined : workflow.steps[nextRunnableIndex];
+  const phases = workflowPhaseSnapshots(workflow);
 
   return {
-    current: currentIndex >= 0 ? currentIndex + 1 : done < total ? done + 1 : undefined,
+    blocked,
+    current:
+      currentIndex >= 0 && currentStep ? { index: currentIndex, step: currentStep } : undefined,
     done,
+    nextRunnable:
+      nextRunnableIndex !== undefined && nextRunnableStep
+        ? { index: nextRunnableIndex, step: nextRunnableStep }
+        : undefined,
+    phases,
     total,
   };
+}
+
+function workflowPhaseSnapshots(workflow: GoalWorkflow): Array<WorkflowPhaseSnapshot> {
+  const phases = new Map<string, WorkflowPhaseSnapshot>();
+
+  for (const [index, step] of workflow.steps.entries()) {
+    const title = workflowPhaseTitle(step);
+    const phase = phases.get(title) ?? { blocked: 0, done: 0, title, total: 0 };
+    phases.set(title, {
+      ...phase,
+      blocked: phase.blocked + (step.status === "blocked" ? 1 : 0),
+      current: isCurrentWorkflowStep(step) ? index + 1 : phase.current,
+      done: phase.done + (step.status === "done" ? 1 : 0),
+      total: phase.total + 1,
+    });
+  }
+
+  return [...phases.values()];
+}
+
+function workflowPhaseTitle(step: WorkflowStep) {
+  return step.phase ?? DEFAULT_WORKFLOW_PHASE_TITLE;
 }
 
 function workflowStepIcon(status: WorkflowStepStatus) {
@@ -1515,6 +1719,26 @@ function formatDuration(milliseconds: number) {
   const hours = Math.floor(minutes / 60);
   const remainingMinutes = minutes % 60;
   return remainingMinutes > 0 ? `${hours}h${remainingMinutes}m` : `${hours}h`;
+}
+
+function formatRelativeTime(timestamp: number, now = Date.now()) {
+  const ageMs = Math.max(0, now - timestamp);
+  const seconds = Math.floor(ageMs / 1000);
+  if (seconds < 60) {
+    return "just now";
+  }
+
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes}m ago`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours}h ago`;
+  }
+
+  return new Date(timestamp).toISOString();
 }
 
 function renderGoalContext(goal: GoalRecord) {
@@ -1592,23 +1816,27 @@ function renderWorkflowContinuation(goal: GoalRecord) {
     return `No persisted workflow is set. For multi-step work, call create_workflow after inspecting the current state with 1-${MAX_WORKFLOW_STEPS} outcome-based steps, stable ids, dependencies where useful, and concrete verification checks. Skip this for trivial goals.`;
   }
 
-  const current = getCurrentWorkflowStep(goal.workflow);
-  const hasRunnable = findNextRunnableStepIndex(goal.workflow) !== undefined;
+  const snapshot = workflowSnapshot(goal.workflow);
+  const current = snapshot.current;
+  const hasRunnable = snapshot.nextRunnable !== undefined;
   const isComplete = goal.workflow.steps.every((step) => step.status === "done");
   return [
-    renderWorkflowProgressLine(goal.workflow),
+    renderWorkflowProgressLineFromSnapshot(snapshot),
+    renderWorkflowPhaseSummary(snapshot),
     !current && !hasRunnable && !isComplete
       ? "No runnable step is active. Inspect dependencies or unblock the workflow before continuing."
       : undefined,
     current ? "" : undefined,
     current ? "Current runnable step:" : undefined,
+    current?.step.phase ? `Phase: ${current.step.phase}` : undefined,
     current ? renderWorkflowStepLine(current.step, current.index) : undefined,
     ...(current ? renderWorkflowStepDetails(current.step) : []),
     current ? "" : undefined,
     "Workflow ledger:",
-    ...goal.workflow.steps.flatMap(renderWorkflowStepBlock),
+    ...renderWorkflowLedger(goal.workflow, snapshot),
     goal.workflow.verification.length > 0 ? "Verification checks:" : undefined,
     ...goal.workflow.verification.map((check) => `- ${check}`),
+    renderWorkflowEventsSummary(goal.workflow),
   ]
     .filter(isDefined)
     .join("\n");
@@ -1664,23 +1892,23 @@ function decodeGoal(value: unknown): GoalRecord | undefined {
     return undefined;
   }
 
+  const createdAt = decodeTimestamp(value.createdAt);
+
   return {
     activeDurationMs: typeof value.activeDurationMs === "number" ? value.activeDurationMs : 0,
     activeSince:
       typeof value.activeSince === "number"
-        ? value.activeSince
+        ? decodeTimestamp(value.activeSince)
         : status === "active"
-          ? typeof value.createdAt === "number"
-            ? value.createdAt
-            : Date.now()
+          ? createdAt
           : undefined,
-    createdAt: typeof value.createdAt === "number" ? value.createdAt : Date.now(),
+    createdAt,
     handoff: decodeHandoff(value.handoff),
     objective,
     receipts: decodeTurnReceipts(value.receipts),
     status,
     tokenBudget: typeof value.tokenBudget === "number" ? value.tokenBudget : undefined,
-    updatedAt: typeof value.updatedAt === "number" ? value.updatedAt : Date.now(),
+    updatedAt: decodeTimestamp(value.updatedAt),
     workflow: decodeWorkflow(value.workflow),
   };
 }
@@ -1806,7 +2034,7 @@ function decodeHandoff(value: unknown): GoalHandoff | undefined {
     purpose: trimPersistedText(purpose, MAX_SHORT_TEXT_LENGTH),
     references: decodeBoundedTextList(value.references, MAX_HANDOFF_REFERENCES) ?? [],
     summary: trimPersistedText(summary, MAX_TEXT_LENGTH),
-    updatedAt: typeof value.updatedAt === "number" ? value.updatedAt : Date.now(),
+    updatedAt: decodeTimestamp(value.updatedAt),
   };
 }
 
@@ -1832,7 +2060,7 @@ function decodeTurnReceipt(value: unknown): GoalTurnReceipt | undefined {
 
   return {
     id: trimPersistedText(id, MAX_SHORT_TEXT_LENGTH),
-    recordedAt: typeof value.recordedAt === "number" ? value.recordedAt : Date.now(),
+    recordedAt: decodeTimestamp(value.recordedAt),
     status: value.status,
     tools: decodeToolReceipts(value.tools),
     userMessage: trimPersistedText(userMessage, MAX_SHORT_TEXT_LENGTH),
@@ -1892,7 +2120,7 @@ function decodeWorkflowInput(
     return `verification must be an array of strings with at most ${MAX_WORKFLOW_STEPS} items.`;
   }
 
-  const workflow = { steps, verification };
+  const workflow = { events: existing?.events ?? [], steps, verification };
   const validationError = validateWorkflow(workflow);
   return validationError ?? workflow;
 }
@@ -1935,6 +2163,15 @@ function decodeWorkflowStepInput(
   }
 
   const evidence = typeof value.evidence === "string" ? value.evidence.trim() : "";
+  if (value.phase !== undefined && typeof value.phase !== "string") {
+    return "phase must be a string when provided.";
+  }
+  const phase =
+    value.phase === undefined
+      ? existing?.id === id
+        ? existing.phase
+        : undefined
+      : trimPersistedText(value.phase, MAX_WORKFLOW_STEP_PHASE_LENGTH) || undefined;
   const dependsOn = decodeWorkflowStepIdList(
     value.depends_on ?? value.dependsOn,
     "depends_on",
@@ -1957,6 +2194,7 @@ function decodeWorkflowStepInput(
     dependsOn,
     evidence: evidence || undefined,
     id,
+    phase: phase || undefined,
     status,
     text,
     verification,
@@ -1981,6 +2219,7 @@ function decodeWorkflow(value: unknown): GoalWorkflow | undefined {
   }
 
   const workflow = {
+    events: decodeWorkflowEvents(value.events),
     steps,
     verification: decodeBoundedTextList(value.verification, MAX_WORKFLOW_STEPS) ?? [],
   };
@@ -2000,6 +2239,10 @@ function decodePersistedWorkflowStep(value: unknown, index: number): WorkflowSte
 
   const status = decodeWorkflowStepStatus(value.status) ?? "pending";
   const evidence = typeof value.evidence === "string" ? value.evidence.trim() : "";
+  const phase =
+    typeof value.phase === "string"
+      ? trimPersistedText(value.phase, MAX_WORKFLOW_STEP_PHASE_LENGTH)
+      : undefined;
   const id = normalizeWorkflowStepId(getString(value, "id") ?? `step-${index + 1}`);
   if (!id) {
     return undefined;
@@ -2017,10 +2260,63 @@ function decodePersistedWorkflowStep(value: unknown, index: number): WorkflowSte
     dependsOn,
     evidence: evidence || undefined,
     id,
+    phase: phase || undefined,
     status,
     text,
     verification: decodeBoundedTextList(value.verification, MAX_WORKFLOW_STEP_VERIFICATION) ?? [],
   };
+}
+
+function appendWorkflowEvent(
+  workflow: GoalWorkflow,
+  type: WorkflowEventType,
+  detail?: string,
+  stepId?: string,
+  at = Date.now(),
+): GoalWorkflow {
+  const event: WorkflowEvent = {
+    at,
+    detail: detail ? trimPersistedText(detail, MAX_SHORT_TEXT_LENGTH) : undefined,
+    stepId,
+    type,
+  };
+
+  return {
+    ...workflow,
+    events: [...workflow.events, event].slice(-MAX_WORKFLOW_EVENTS),
+  };
+}
+
+function decodeWorkflowEvents(value: unknown): Array<WorkflowEvent> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.map(decodeWorkflowEvent).filter(isDefined).slice(-MAX_WORKFLOW_EVENTS);
+}
+
+function decodeWorkflowEvent(value: unknown): WorkflowEvent | undefined {
+  if (!isRecord(value) || !isWorkflowEventType(value.type)) {
+    return undefined;
+  }
+
+  const detail = typeof value.detail === "string" ? value.detail.trim() : "";
+  const stepId =
+    typeof value.stepId === "string" ? normalizeWorkflowStepId(value.stepId) : undefined;
+  return {
+    at: decodeTimestamp(value.at),
+    detail: detail ? trimPersistedText(detail, MAX_SHORT_TEXT_LENGTH) : undefined,
+    stepId,
+    type: value.type,
+  };
+}
+
+function decodeTimestamp(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return Date.now();
+  }
+
+  return Number.isNaN(new Date(value).getTime()) ? Date.now() : value;
 }
 
 function validateWorkflow(workflow: GoalWorkflow): string | undefined {
@@ -2199,6 +2495,10 @@ function isTurnReceiptStatus(value: unknown): value is GoalTurnReceipt["status"]
 
 function decodeWorkflowStepStatus(value: unknown): WorkflowStepStatus | undefined {
   return WORKFLOW_STEP_STATUSES.find((status) => status === value);
+}
+
+function isWorkflowEventType(value: unknown): value is WorkflowEventType {
+  return WORKFLOW_EVENT_TYPES.some((type) => type === value);
 }
 
 function isCurrentWorkflowStep(step: WorkflowStep) {
