@@ -82,11 +82,32 @@ Useful commands:
 
 Legacy-compatible tools: `goal_continue` and `update_goal_workflow` still work.
 
-Status examples:
+Status bar examples stay compact:
 
 ```text
 ⠋ Goal active · Step 2/5 · 12m
+Ⅱ Goal paused · Step 2/5 · 18m
+■ Goal blocked · Step 4/5 · 27m
+✓ Goal complete · 5/5 done · 31m
 ⠋ Goal active · 12m
+```
+
+Workflow output carries the detail:
+
+```text
+Workflow: 1/2 done, current 2/2
+Phases: Discovery 1/1 done; Verification 0/1 done, current step 2
+
+Current step:
+Phase: Verification
+▶ 2. verify: Verify smoke result
+   after: inspect
+
+Recent workflow events:
+- just now created: workflow set
+- just now activated inspect: Inspect smoke state
+- just now done inspect: real Amp smoke activated inspect
+- just now activated verify: Verify smoke result
 ```
 
 ## Development
