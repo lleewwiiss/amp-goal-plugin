@@ -53,7 +53,7 @@ The difference: the plugin stores compact Amp-native state, derives a fresh work
 
 ## Install
 
-If `amp plugins add` rejects this GitHub URL, install the plugin by copying the raw file:
+Install the plugin by copying the raw file:
 
 ```bash
 mkdir -p ~/.config/amp/plugins

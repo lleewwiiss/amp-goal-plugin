@@ -26,11 +26,12 @@
   ],
   "type": "module",
   "scripts": {
-    "check": "bun run typecheck && bun run lint && bun run format:check",
+    "check": "bun run typecheck && bun run lint && bun test && bun run format:check",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",
     "install:plugin": "mkdir -p ~/.config/amp/plugins && cp src/goal.ts ~/.config/amp/plugins/goal.ts",
     "lint": "oxlint .",
+    "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

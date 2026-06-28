@@ -122,6 +122,7 @@ const MAX_WORKFLOW_STEP_DEPENDENCIES = 4;
 const MAX_WORKFLOW_STEP_VERIFICATION = 4;
 const MAX_TEXT_LENGTH = 1200;
 const MAX_SHORT_TEXT_LENGTH = 240;
+const GOAL_OVERRIDE_TTL_MS = 10_000;
 const WORKFLOW_EVENT_TYPES = [
   "created",
   "activated",
@@ -1557,12 +1558,10 @@ async function getGoal(amp: PluginAPI, threadId: string): Promise<GoalRecord | u
 }
 
 function decodeStoredGoal(amp: PluginAPI, config: Record<string, unknown>, threadId: string) {
-  const goal = decodeThreadGoalFromConfig(amp, config, threadId);
-  if (goal) {
-    return goal;
-  }
-
-  return decodeLegacyGoal(config, threadId);
+  return newestGoal([
+    decodeThreadGoalFromConfig(amp, config, threadId),
+    decodeLegacyGoal(config, threadId),
+  ]);
 }
 
 function decodeThreadGoalFromConfig(
@@ -1588,10 +1587,16 @@ function decodeThreadGoalFromConfig(
     amp.logger.log("invalid goal config for thread", threadId, configKey);
   }
 
-  return goals.reduce<GoalRecord | undefined>(
-    (newest, goal) => (!newest || goal.updatedAt > newest.updatedAt ? goal : newest),
-    undefined,
-  );
+  return newestGoal(goals);
+}
+
+function newestGoal(goals: Array<GoalRecord | undefined>) {
+  return goals
+    .filter(isDefined)
+    .reduce<GoalRecord | undefined>(
+      (newest, goal) => (!newest || goal.updatedAt > newest.updatedAt ? goal : newest),
+      undefined,
+    );
 }
 
 function chooseNewestGoal(goal: GoalRecord | undefined, override: GoalOverride) {
@@ -1617,12 +1622,17 @@ async function deleteGoalRecord(amp: PluginAPI, threadId: string) {
 }
 
 function getGoalOverride(threadId: string): GoalOverrideLookup {
-  if (!goalOverrides.has(threadId)) {
+  const override = goalOverrides.get(threadId);
+  if (!override) {
+    return { exists: false as const };
+  }
+  if (Date.now() - override.updatedAt > GOAL_OVERRIDE_TTL_MS) {
+    goalOverrides.delete(threadId);
     return { exists: false as const };
   }
   return {
     exists: true as const,
-    ...(goalOverrides.get(threadId) ?? { goal: undefined, updatedAt: 0 }),
+    ...override,
   };
 }
 
@@ -1810,8 +1820,11 @@ function renderWorkflowPage(goal: GoalRecord, notice?: string) {
   return [
     notice,
     notice ? "" : undefined,
-    "All:",
-    ...workflow.steps.map(renderWorkflowStepCompactLine),
+    "All steps:",
+    ...renderWorkflowLedger(workflow),
+    workflow.verification.length > 0 ? "" : undefined,
+    workflow.verification.length > 0 ? "Verification:" : undefined,
+    ...workflow.verification.map((check) => `- ${check}`),
   ]
     .filter(isDefined)
     .join("\n");
@@ -1931,10 +1944,6 @@ function renderWorkflowStepLine(step: WorkflowStep, index: number) {
   return `${workflowStepIcon(step.status)} ${index + 1}. ${step.id}: ${step.text}${
     step.evidence ? ` — ${step.evidence}` : ""
   }`;
-}
-
-function renderWorkflowStepCompactLine(step: WorkflowStep, index: number) {
-  return `${workflowStepIcon(step.status)} ${index + 1}. ${step.text}`;
 }
 
 function renderWorkflowStepDetails(step: WorkflowStep) {
