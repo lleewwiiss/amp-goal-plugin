@@ -30,6 +30,12 @@ type HarnessAPI = Pick<
   | "registerTool"
 >;
 
+interface HarnessOptions {
+  staleReadsAfterMutation?: number;
+}
+
+type ConfigurationTarget = Parameters<PluginAPI["configuration"]["update"]>[1];
+
 const subscription: Subscription = { unsubscribe() {} };
 const logger: PluginAPI["logger"] = { log() {} };
 const shell: PluginCommandContext["$"] = async () => ({ exitCode: 0, stderr: "", stdout: "" });
@@ -50,19 +56,37 @@ let nextThreadId = 0;
 function createHarness(
   initialConfig: Record<string, unknown> = {},
   threadId = `T-test-${(nextThreadId += 1)}` as ThreadID,
+  options: HarnessOptions = {},
 ) {
   const config = structuredClone(initialConfig);
+  const globalConfig: Record<string, unknown> = {};
   const commands = new Map<string, (ctx: PluginCommandContext) => void | Promise<void>>();
   const handlers = new Map<string, (event: unknown) => unknown>();
   const thread = createThread(threadId);
   const tools = new Map<string, PluginToolDefinition>();
+  let staleConfig = mergedConfig();
+  let staleReadsRemaining = 0;
+
+  function mergedConfig() {
+    return { ...globalConfig, ...config };
+  }
+
+  function configForTarget(target: ConfigurationTarget) {
+    return target === "global" ? globalConfig : config;
+  }
 
   const configuration: PluginAPI["configuration"] = {
-    async delete(key: string) {
-      delete config[key];
+    async delete(key: string, target?: ConfigurationTarget) {
+      staleConfig = mergedConfig();
+      staleReadsRemaining = options.staleReadsAfterMutation ?? 0;
+      delete configForTarget(target)[key];
     },
     async get() {
-      return structuredClone(config);
+      if (staleReadsRemaining > 0) {
+        staleReadsRemaining -= 1;
+        return structuredClone(staleConfig);
+      }
+      return structuredClone(mergedConfig());
     },
     pipe<Out>(op: (input: PluginAPI["configuration"]) => Out) {
       return op(configuration);
@@ -73,8 +97,10 @@ function createHarness(
     [Symbol.observable]() {
       return configuration;
     },
-    async update(update: Record<string, unknown>) {
-      Object.assign(config, structuredClone(update));
+    async update(update: Record<string, unknown>, target?: ConfigurationTarget) {
+      staleConfig = mergedConfig();
+      staleReadsRemaining = options.staleReadsAfterMutation ?? 0;
+      Object.assign(configForTarget(target), structuredClone(update));
     },
   } satisfies PluginAPI["configuration"];
 
@@ -130,7 +156,7 @@ function createHarness(
 
   goalPlugin(amp as unknown as PluginAPI);
 
-  return { commands, config, handlers, thread, threadId, tools };
+  return { commands, config, globalConfig, handlers, thread, threadId, tools };
 }
 
 function observable<T>(current: T): Observable<T> {
@@ -317,7 +343,7 @@ describe("goal plugin public seam", () => {
       const harness = createHarness();
 
       await callTool(harness, "create_goal", { objective: "delete me" });
-      delete harness.config[`goalPlugin.thread.${harness.threadId}`];
+      delete harness.globalConfig[`goalPlugin.thread.${harness.threadId}`];
 
       Date.now = () => start + 60_000;
       const result = await callTool(harness, "get_goal");
@@ -326,6 +352,114 @@ describe("goal plugin public seam", () => {
     } finally {
       Date.now = realNow;
     }
+  });
+
+  test("global writes clear stale workspace thread state after override expires", async () => {
+    const realNow = Date.now;
+    const start = realNow();
+    const threadId = "T-test-workspace-shadow";
+    Date.now = () => start;
+    try {
+      const harness = createHarness(
+        { [`goalPlugin.thread.${threadId}`]: goalRecord("old workspace", start + 10_000) },
+        threadId,
+        { staleReadsAfterMutation: 3 },
+      );
+
+      const replaced = await callTool(harness, "replace_goal", { objective: "new global" });
+      expect(replaced.output).toContain("new global");
+
+      Date.now = () => start + 60_000;
+      const result = await callTool(harness, "get_goal");
+
+      expect(result.output).toContain("new global");
+      expect(result.output.includes("old workspace")).toBe(false);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("global writes clear amp-prefixed global thread shadows", async () => {
+    const realNow = Date.now;
+    const start = realNow();
+    const threadId = "T-test-global-amp-shadow";
+    Date.now = () => start;
+    try {
+      const harness = createHarness({}, threadId);
+      harness.globalConfig[`amp.goalPlugin.thread.${threadId}`] = goalRecord(
+        "old amp shadow",
+        start + 10_000,
+      );
+
+      const replaced = await callTool(harness, "replace_goal", { objective: "new global" });
+      expect(replaced.output).toContain("new global");
+
+      Date.now = () => start + 60_000;
+      const result = await callTool(harness, "get_goal");
+
+      expect(result.output).toContain("new global");
+      expect(result.output.includes("old amp shadow")).toBe(false);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("global writes clear stale workspace legacy state after override expires", async () => {
+    const realNow = Date.now;
+    const start = realNow();
+    const threadId = "T-test-workspace-legacy-shadow";
+    Date.now = () => start;
+    try {
+      const harness = createHarness(
+        {
+          goalPlugin: {
+            threads: { [threadId]: goalRecord("old workspace legacy", start + 10_000) },
+            version: 1,
+          },
+        },
+        threadId,
+        { staleReadsAfterMutation: 3 },
+      );
+
+      const replaced = await callTool(harness, "replace_goal", { objective: "new global" });
+      expect(replaced.output).toContain("new global");
+
+      Date.now = () => start + 60_000;
+      const result = await callTool(harness, "get_goal");
+
+      expect(result.output).toContain("new global");
+      expect(result.output.includes("old workspace legacy")).toBe(false);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("goal creation waits for config reads to observe the write", async () => {
+    const harness = createHarness({}, undefined, { staleReadsAfterMutation: 2 });
+
+    await callTool(harness, "create_goal", { objective: "eventually visible" });
+
+    const realNow = Date.now;
+    Date.now = () => realNow() + 60_000;
+    try {
+      const result = await callTool(harness, "get_goal");
+
+      expect(result.output).toContain("eventually visible");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("goal updates wait by value instead of object key order", async () => {
+    const harness = createHarness();
+
+    await callTool(harness, "create_goal", { objective: "handoff order" });
+    const result = await callTool(harness, "update_goal_handoff", {
+      purpose: "resume",
+      summary: "state to preserve",
+    });
+
+    expect(result.output).toContain("Handoff Note: resume");
   });
 
   test("workflow dialog keeps dependencies and verification details", async () => {

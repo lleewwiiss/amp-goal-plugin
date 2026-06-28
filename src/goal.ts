@@ -2,6 +2,7 @@ import type {
   AgentEndEvent,
   PluginAPI,
   PluginCommandContext,
+  PluginConfigurationTarget,
   PluginToolContext,
   StatusItemValue,
   ThreadMessage,
@@ -123,6 +124,8 @@ const MAX_WORKFLOW_STEP_VERIFICATION = 4;
 const MAX_TEXT_LENGTH = 1200;
 const MAX_SHORT_TEXT_LENGTH = 240;
 const GOAL_OVERRIDE_TTL_MS = 10_000;
+const CONFIG_VISIBILITY_TIMEOUT_MS = 2000;
+const CONFIG_VISIBILITY_POLL_MS = 25;
 const WORKFLOW_EVENT_TYPES = [
   "created",
   "activated",
@@ -1610,15 +1613,57 @@ function chooseNewestGoal(goal: GoalRecord | undefined, override: GoalOverride) 
 }
 
 async function updateGoalRecord(amp: PluginAPI, threadId: string, goal: GoalRecord) {
-  await amp.configuration.update({ [threadConfigKey(threadId)]: goal }, GOAL_CONFIG_TARGET);
+  const key = threadConfigKey(threadId);
+  await amp.configuration.update({ [key]: goal }, GOAL_CONFIG_TARGET);
   setGoalOverride(threadId, goal);
+  await amp.configuration.delete(ampSettingsKey(key), GOAL_CONFIG_TARGET);
+  await deleteConfigValue(amp, key, "workspace");
   await safelyPruneLegacyGoal(amp, threadId);
+  await waitForGoalConfigWrite(amp, threadId, goal);
 }
 
 async function deleteGoalRecord(amp: PluginAPI, threadId: string) {
-  await deleteConfigValue(amp, threadConfigKey(threadId));
+  await deleteConfigValueFromAllTargets(amp, threadConfigKey(threadId));
   setGoalOverride(threadId, undefined);
   await pruneLegacyGoal(amp, threadId);
+  await waitForGoalConfigDelete(amp, threadId);
+}
+
+async function waitForGoalConfigWrite(amp: PluginAPI, threadId: string, goal: GoalRecord) {
+  await waitForGoalConfig(
+    amp,
+    (config) => {
+      const storedGoal = decodeStoredGoal(amp, config, threadId);
+      return isSameGoalRecord(storedGoal, goal);
+    },
+    `goal config write for ${threadId} was not visible after ${CONFIG_VISIBILITY_TIMEOUT_MS}ms`,
+  );
+}
+
+async function waitForGoalConfigDelete(amp: PluginAPI, threadId: string) {
+  await waitForGoalConfig(
+    amp,
+    (config) => decodeStoredGoal(amp, config, threadId) === undefined,
+    `goal config delete for ${threadId} was not visible after ${CONFIG_VISIBILITY_TIMEOUT_MS}ms`,
+  );
+}
+
+async function waitForGoalConfig(
+  amp: PluginAPI,
+  isVisible: (config: Record<string, unknown>) => boolean,
+  timeoutMessage: string,
+) {
+  const deadline = performance.now() + CONFIG_VISIBILITY_TIMEOUT_MS;
+
+  while (true) {
+    if (isVisible(await amp.configuration.get())) {
+      return;
+    }
+    if (performance.now() >= deadline) {
+      throw new Error(timeoutMessage);
+    }
+    await sleep(CONFIG_VISIBILITY_POLL_MS);
+  }
 }
 
 function getGoalOverride(threadId: string): GoalOverrideLookup {
@@ -1659,11 +1704,11 @@ async function pruneLegacyGoal(amp: PluginAPI, threadId: string) {
   const nextThreads = { ...legacyState.threads };
   delete nextThreads[threadId];
   if (Object.keys(nextThreads).length === 0) {
-    await deleteConfigValue(amp, LEGACY_CONFIG_KEY);
+    await deleteConfigValueFromAllTargets(amp, LEGACY_CONFIG_KEY);
     return;
   }
 
-  await deleteConfigValue(amp, LEGACY_CONFIG_KEY);
+  await deleteConfigValueFromAllTargets(amp, LEGACY_CONFIG_KEY);
   await amp.configuration.update(
     { [LEGACY_CONFIG_KEY]: { ...legacyState, threads: nextThreads } },
     GOAL_CONFIG_TARGET,
@@ -1721,9 +1766,42 @@ function threadConfigKey(threadId: string) {
   return `${THREAD_CONFIG_PREFIX}${threadId}`;
 }
 
-async function deleteConfigValue(amp: PluginAPI, key: string) {
-  await amp.configuration.delete(key, GOAL_CONFIG_TARGET);
-  await amp.configuration.delete(ampSettingsKey(key), GOAL_CONFIG_TARGET);
+async function deleteConfigValue(
+  amp: PluginAPI,
+  key: string,
+  target: PluginConfigurationTarget = GOAL_CONFIG_TARGET,
+) {
+  await amp.configuration.delete(key, target);
+  await amp.configuration.delete(ampSettingsKey(key), target);
+}
+
+async function deleteConfigValueFromAllTargets(amp: PluginAPI, key: string) {
+  await deleteConfigValue(amp, key, GOAL_CONFIG_TARGET);
+  await deleteConfigValue(amp, key, "workspace");
+}
+
+function isSameGoalRecord(goal: GoalRecord | undefined, expected: GoalRecord) {
+  return goal !== undefined && stableJson(goal) === stableJson(expected);
+}
+
+function stableJson(value: unknown) {
+  return JSON.stringify(stableJsonValue(value));
+}
+
+function stableJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(stableJsonValue);
+  }
+  if (!isRecord(value)) {
+    return value;
+  }
+
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, entryValue]) => entryValue !== undefined)
+      .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+      .map(([key, entryValue]) => [key, stableJsonValue(entryValue)]),
+  );
 }
 
 function ampSettingsKey(key: string) {
@@ -2885,6 +2963,12 @@ function getPositiveInteger(input: Record<string, unknown>, key: string) {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function sleep(ms: number) {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function unrefTimer(timer: unknown) {
