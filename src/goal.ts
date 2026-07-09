@@ -6,14 +6,12 @@ import type {
   PluginToolContext,
   StatusItemValue,
   ThreadMessage,
-  ToolCallEvent,
-  ToolCallResult,
   ToolCallWithResult,
+  ThreadID,
 } from "@ampcode/plugin";
 
 type GoalStatus = "active" | "paused" | "blocked" | "complete";
 type GoalToolReceiptStatus = ToolCallWithResult["result"]["status"];
-type ThreadID = ToolCallEvent["thread"]["id"];
 type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];
 type WorkflowStepStatus = (typeof WORKFLOW_STEP_STATUSES)[number];
 
@@ -535,8 +533,6 @@ export default function goalPlugin(amp: PluginAPI) {
     name: "update_goal_handoff",
   });
 
-  amp.on("tool.call", async (event) => handleGoalPluginToolCall(amp, status, event));
-
   amp.on("agent.start", async (event) => {
     await status.refresh(event.thread.id);
     const goal = await getGoal(amp, event.thread.id);
@@ -584,9 +580,20 @@ interface WorkflowRunResult {
   output: string;
 }
 
+interface GoalToolEvent {
+  input: Record<string, unknown>;
+  thread: { id: ThreadID };
+  tool: string;
+}
+
+interface GoalToolResult {
+  exitCode: number;
+  output: string;
+}
+
 function createGoalStatus(amp: PluginAPI): GoalStatusController {
   const experimental = amp.experimental;
-  if (!experimental) {
+  if (!experimental?.createStatusItem) {
     return {
       async refresh() {},
       async start() {},
@@ -594,7 +601,7 @@ function createGoalStatus(amp: PluginAPI): GoalStatusController {
   }
 
   let statusItem: ReturnType<typeof experimental.createStatusItem> | undefined;
-  let activeThreadId = experimental.activeThread.current?.id;
+  let activeThreadId = amp.activeThread.current?.id;
   let activeGoal: GoalRecord | undefined;
   let started = false;
 
@@ -641,9 +648,9 @@ function createGoalStatus(amp: PluginAPI): GoalStatusController {
 
       started = true;
       activeThreadId =
-        experimental.activeThread.current?.id ?? (isThreadId(threadId) ? threadId : undefined);
+        amp.activeThread.current?.id ?? (isThreadId(threadId) ? threadId : undefined);
 
-      experimental.activeThread.subscribe((thread) => {
+      amp.activeThread.subscribe((thread) => {
         activeThreadId = thread?.id;
         void refreshActiveThread();
       });
@@ -997,7 +1004,7 @@ async function executeGoalPluginTool(
   input: Record<string, unknown>,
   ctx: PluginToolContext,
 ) {
-  const threadId = getToolThreadId(amp, ctx);
+  const threadId = getToolThreadId(ctx);
   if (!threadId) {
     throw new Error(`${tool} failed: no active thread for this tool invocation.`);
   }
@@ -1006,17 +1013,19 @@ async function executeGoalPluginTool(
     input,
     thread: { id: threadId },
     tool,
-    toolUseID: `goal-plugin-${tool}`,
   });
 
-  return toolExecutionOutput(result, tool);
+  if (result.exitCode !== 0) {
+    throw new Error(result.output);
+  }
+  return result.output;
 }
 
 async function handleGoalPluginToolCall(
   amp: PluginAPI,
   statusController: GoalStatusController,
-  event: ToolCallEvent,
-): Promise<ToolCallResult> {
+  event: GoalToolEvent,
+): Promise<GoalToolResult> {
   if (event.tool === "create_goal") {
     return handleCreateGoalTool(amp, statusController, event);
   }
@@ -1047,30 +1056,14 @@ async function handleGoalPluginToolCall(
   if (event.tool === "update_goal_handoff") {
     return handleUpdateGoalHandoffTool(amp, statusController, event);
   }
-  return { action: "allow" };
+  return synthesize(`${event.tool} was not handled by the goal plugin.`, 1);
 }
 
-function toolExecutionOutput(result: ToolCallResult, tool: string) {
-  if (result.action === "synthesize") {
-    if (result.result.exitCode && result.result.exitCode !== 0) {
-      throw new Error(result.result.output);
-    }
-    return result.result.output;
-  }
-  if (result.action === "reject-and-continue" || result.action === "error") {
-    throw new Error(result.message);
-  }
-  throw new Error(`${tool} was not handled by the goal plugin.`);
-}
-
-function getToolThreadId(amp: PluginAPI, ctx: PluginToolContext): ThreadID | undefined {
+function getToolThreadId(ctx: PluginToolContext): ThreadID | undefined {
   const contextThreadId = readThreadId(ctx);
   if (isThreadId(contextThreadId)) {
     return contextThreadId;
   }
-
-  const activeThreadId = readActiveThreadId(amp);
-  return isThreadId(activeThreadId) ? activeThreadId : undefined;
 }
 
 function readThreadId(value: unknown) {
@@ -1080,17 +1073,6 @@ function readThreadId(value: unknown) {
   return value.thread.id;
 }
 
-function readActiveThreadId(value: unknown) {
-  if (!isRecord(value) || !isRecord(value.activeThread)) {
-    return undefined;
-  }
-  const current = value.activeThread.current;
-  if (!isRecord(current)) {
-    return undefined;
-  }
-  return current.id;
-}
-
 function isThreadId(value: unknown): value is ThreadID {
   return typeof value === "string" && value.startsWith("T-");
 }
@@ -1098,7 +1080,7 @@ function isThreadId(value: unknown): value is ThreadID {
 async function handleCreateGoalTool(
   amp: PluginAPI,
   statusController: GoalStatusController,
-  event: ToolCallEvent,
+  event: GoalToolEvent,
 ) {
   const objective = getString(event.input, "objective")?.trim();
   if (!objective) {
@@ -1121,14 +1103,14 @@ async function handleCreateGoalTool(
   return synthesize(renderGoalToolResult(goal));
 }
 
-async function handleGetGoalTool(amp: PluginAPI, event: ToolCallEvent) {
+async function handleGetGoalTool(amp: PluginAPI, event: GoalToolEvent) {
   return synthesize(renderGoalToolResult(await getGoal(amp, event.thread.id)));
 }
 
 async function handleReplaceGoalTool(
   amp: PluginAPI,
   statusController: GoalStatusController,
-  event: ToolCallEvent,
+  event: GoalToolEvent,
 ) {
   const objective = getString(event.input, "objective")?.trim();
   if (!objective) {
@@ -1157,7 +1139,7 @@ async function handleReplaceGoalTool(
 async function handleUpdateGoalTool(
   amp: PluginAPI,
   statusController: GoalStatusController,
-  event: ToolCallEvent,
+  event: GoalToolEvent,
 ) {
   const status = getString(event.input, "status");
   if (status !== "complete" && status !== "blocked") {
@@ -1186,7 +1168,7 @@ async function handleUpdateGoalTool(
   return synthesize(renderGoalToolResult(await getGoal(amp, event.thread.id)));
 }
 
-async function handleGoalContinueTool(amp: PluginAPI, event: ToolCallEvent) {
+async function handleGoalContinueTool(amp: PluginAPI, event: GoalToolEvent) {
   const goal = await getGoal(amp, event.thread.id);
   if (!goal) {
     return synthesize("goal_continue failed: no goal set for this thread.", 1);
@@ -1201,7 +1183,7 @@ async function handleGoalContinueTool(amp: PluginAPI, event: ToolCallEvent) {
 async function handleUpdateGoalWorkflowTool(
   amp: PluginAPI,
   statusController: GoalStatusController,
-  event: ToolCallEvent,
+  event: GoalToolEvent,
 ) {
   const toolName = event.tool;
   const goal = await getGoal(amp, event.thread.id);
@@ -1238,7 +1220,7 @@ async function handleUpdateGoalWorkflowTool(
 async function handleUpdateWorkflowStepTool(
   amp: PluginAPI,
   statusController: GoalStatusController,
-  event: ToolCallEvent,
+  event: GoalToolEvent,
 ) {
   const goal = await getGoal(amp, event.thread.id);
   if (!goal) {
@@ -1268,7 +1250,7 @@ async function handleUpdateWorkflowStepTool(
 async function handleRunWorkflowTool(
   amp: PluginAPI,
   statusController: GoalStatusController,
-  event: ToolCallEvent,
+  event: GoalToolEvent,
 ) {
   const result = await runWorkflowForThread(amp, statusController, event.thread.id, event.tool);
   return synthesize(result.output, result.exitCode);
@@ -1277,7 +1259,7 @@ async function handleRunWorkflowTool(
 async function handleWorkflowContinueTool(
   amp: PluginAPI,
   statusController: GoalStatusController,
-  event: ToolCallEvent,
+  event: GoalToolEvent,
 ) {
   const goal = await getGoal(amp, event.thread.id);
   if (!goal) {
@@ -1294,7 +1276,7 @@ async function handleWorkflowContinueTool(
 async function handleUpdateGoalHandoffTool(
   amp: PluginAPI,
   statusController: GoalStatusController,
-  event: ToolCallEvent,
+  event: GoalToolEvent,
 ) {
   const goal = await getGoal(amp, event.thread.id);
   if (!goal) {
@@ -2987,8 +2969,5 @@ function isDefined<T>(value: T | undefined): value is T {
 }
 
 function synthesize(output: string, exitCode = 0) {
-  return {
-    action: "synthesize" as const,
-    result: { exitCode, output },
-  };
+  return { exitCode, output } satisfies GoalToolResult;
 }

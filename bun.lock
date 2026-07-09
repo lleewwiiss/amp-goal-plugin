@@ -5,7 +5,7 @@
     "": {
       "name": "amp-goal-plugin",
       "devDependencies": {
-        "@ampcode/plugin": "^0.0.0-20260627023428-g3057763",
+        "@ampcode/plugin": "0.0.0-20260709003202-g32d9f9d",
         "@nkzw/eslint-plugin": "^2.0.0",
         "@nkzw/oxlint-config": "^1.2.1",
         "eslint-plugin-no-only-tests": "^3.4.0",
@@ -18,7 +18,7 @@
     },
   },
   "packages": {
-    "@ampcode/plugin": ["@ampcode/plugin@0.0.0-20260627023428-g3057763", "", {}, "sha512-qJn2O0CzCvcHJTmxt1OxPKoKNvL5LlFGA6GbeyzGW1WUDkQI5bzpZp+OlkgOR75dnM0hSVJoFhMlepDtbYZdfg=="],
+    "@ampcode/plugin": ["@ampcode/plugin@0.0.0-20260709003202-g32d9f9d", "", {}, "sha512-F4T7Royk3fmUjpQxN6yW5GHxfT83ZM/sQMTqhoFXx4sPPvTT3YTtTzMawwBqQM1ZzfEH/gQFTvLYM9VOU5I93g=="],
 
     "@babel/code-frame": ["@babel/code-frame@7.29.7", "", { "dependencies": { "@babel/helper-validator-identifier": "^7.29.7", "js-tokens": "^4.0.0", "picocolors": "^1.1.1" } }, "sha512-Aup7aUOfpbAUg2ROOJN6Iw5f9DMBlzu0mIkm/malLQFN/YQgO48wCj0Kxa3sEHJvPVFg7siR+qRInwXd2qhQKw=="],
 

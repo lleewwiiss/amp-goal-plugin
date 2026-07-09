@@ -35,7 +35,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@ampcode/plugin": "^0.0.0-20260627023428-g3057763",
+    "@ampcode/plugin": "0.0.0-20260709003202-g32d9f9d",
     "@nkzw/eslint-plugin": "^2.0.0",
     "@nkzw/oxlint-config": "^1.2.1",
     "eslint-plugin-no-only-tests": "^3.4.0",

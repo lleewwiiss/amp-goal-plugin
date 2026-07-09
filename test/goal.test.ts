@@ -14,8 +14,6 @@ import type {
   PluginToolDefinition,
   Subscription,
   ThreadID,
-  ToolCallEvent,
-  ToolCallResult,
 } from "@ampcode/plugin";
 import goalPlugin from "../src/goal";
 
@@ -23,6 +21,7 @@ type HarnessAPI = Pick<
   PluginAPI,
   | "activeThread"
   | "configuration"
+  | "experimental"
   | "helpers"
   | "logger"
   | "on"
@@ -32,6 +31,7 @@ type HarnessAPI = Pick<
 
 interface HarnessOptions {
   staleReadsAfterMutation?: number;
+  statusItem?: boolean;
 }
 
 type ConfigurationTarget = Parameters<PluginAPI["configuration"]["update"]>[1];
@@ -43,12 +43,16 @@ const ai: PluginCommandContext["ai"] = {
   async ask() {
     return { probability: 0, reason: "test", result: "no" };
   },
+  async generate() {
+    return "";
+  },
 };
 const system: PluginCommandContext["system"] = {
   ampURL: new URL("https://ampcode.com"),
   executor: { kind: "local" },
   async open() {},
   user: null,
+  workspaceRoot: null,
 };
 
 let nextThreadId = 0;
@@ -62,6 +66,7 @@ function createHarness(
   const globalConfig: Record<string, unknown> = {};
   const commands = new Map<string, (ctx: PluginCommandContext) => void | Promise<void>>();
   const handlers = new Map<string, (event: unknown) => unknown>();
+  const statusItems: Array<string> = [];
   const thread = createThread(threadId);
   const tools = new Map<string, PluginToolDefinition>();
   let staleConfig = mergedConfig();
@@ -120,6 +125,21 @@ function createHarness(
   const amp = {
     activeThread,
     configuration,
+    experimental: options.statusItem
+      ? ({
+          createStatusItem(value) {
+            if (value) {
+              statusItems.push(value.text);
+            }
+            return {
+              unsubscribe() {},
+              update(nextValue) {
+                statusItems.push(nextValue.text);
+              },
+            };
+          },
+        } as PluginAPI["experimental"])
+      : undefined,
     helpers: {
       filePathFromURI(uri) {
         return uri.toString();
@@ -156,10 +176,10 @@ function createHarness(
 
   goalPlugin(amp as unknown as PluginAPI);
 
-  return { commands, config, globalConfig, handlers, thread, threadId, tools };
+  return { commands, config, globalConfig, handlers, statusItems, thread, threadId, tools };
 }
 
-function observable<T>(current: T): Observable<T> {
+function observable<T>(): Observable<T> {
   const value: Observable<T> = {
     pipe<Out>(op: (input: Observable<T>) => Out) {
       return op(value);
@@ -177,7 +197,7 @@ function observable<T>(current: T): Observable<T> {
 
 function getObservable<T>(current: T): Observable<T> & { get(): Promise<T> } {
   return {
-    ...observable(current),
+    ...observable<T>(),
     async get() {
       return current;
     },
@@ -264,18 +284,15 @@ async function callTool(
   tool: string,
   input: Record<string, unknown> = {},
 ) {
-  const handler = harness.handlers.get("tool.call");
-  expect(handler).toBeDefined();
+  const definition = harness.tools.get(tool);
+  expect(definition).toBeDefined();
 
-  const result = (await handler?.({
-    input,
-    thread: { id: harness.threadId },
-    tool,
-    toolUseID: `test-${tool}`,
-  } satisfies ToolCallEvent)) as ToolCallResult;
-
-  expect(result.action).toBe("synthesize");
-  return result.action === "synthesize" ? result.result : { exitCode: 1, output: "missing result" };
+  try {
+    const output = await definition?.execute(input, toolContext(harness.thread));
+    return { exitCode: 0, output: String(output ?? "") };
+  } catch (error) {
+    return { exitCode: 1, output: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 describe("goal plugin public seam", () => {
@@ -316,6 +333,16 @@ describe("goal plugin public seam", () => {
     await expect(createGoal?.execute({}, toolContext(harness.thread))).rejects.toThrow(
       "objective is required",
     );
+  });
+
+  test("status item uses top-level active thread with latest plugin API", async () => {
+    const harness = createHarness({}, undefined, { statusItem: true });
+    const sessionStart = harness.handlers.get("session.start");
+
+    await sessionStart?.({ thread: { id: harness.threadId } });
+    await callTool(harness, "create_goal", { objective: "show status" });
+
+    expect(harness.statusItems.some((item) => item.includes("Goal active"))).toBe(true);
   });
 
   test("newest valid goal wins across current and legacy config keys", async () => {
